@@ -19,15 +19,17 @@ PROMPT_TEMPLATE = (
     "<|instruction|>\n"
     "Analyze the Java code and identify ALL security vulnerabilities. "
     "Return structured JSON only.\n\n"
-    "{rag_context}"
     "<|input|>\n{vuln_code}\n\n"
     "<|response|>\n"
 )
 
-# Inserted after the instruction line when RAG results are available
+# Inserted as a Java comment at the top of the code snippet when RAG is available
 RAG_CONTEXT_PREFIX = (
-    "Relevant CVE/CWE context (use to inform your classification):\n"
-    "{context}\n\n"
+    "/*\n"
+    " * RELEVANT VULNERABILITY INTELLIGENCE (CVE/CWE Context):\n"
+    " * Use this to inform your classification.\n"
+    "{context}\n"
+    " */\n"
 )
 
 RESPONSE_MARKER = "<|response|>"
@@ -145,12 +147,14 @@ class VulnerabilityInferenceEngine:
                 ``parse_error``     – True if JSON decoding failed
         """
         try:
-            # Build RAG context block
-            rag_block = ""
+            # Inject RAG context block as a Java comment if provided
             if rag_context and rag_context.strip():
-                rag_block = RAG_CONTEXT_PREFIX.format(context=rag_context.strip())
+                # Format each line of RAG context with a " *" prefix for the block comment
+                comment_lines = "\n".join(f" * {line}" for line in rag_context.strip().split("\n"))
+                rag_block = RAG_CONTEXT_PREFIX.format(context=comment_lines)
+                code = rag_block + code
 
-            prompt = PROMPT_TEMPLATE.format(vuln_code=code, rag_context=rag_block)
+            prompt = PROMPT_TEMPLATE.format(vuln_code=code)
             
             inputs = self.tokenizer(prompt, return_tensors="pt")
             input_ids      = inputs["input_ids"].to(self.model.device)
