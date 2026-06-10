@@ -166,17 +166,22 @@ class VulnerabilityInferenceEngine:
                     eos_token_id=self.tokenizer.eos_token_id
                 )
 
-            # Decode full sequence and isolate the response
-            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Decode full sequence WITH special tokens to retain markers
+            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
 
             # Slice off everything up to and including <|response|>
             marker_idx = decoded.find(RESPONSE_MARKER)
             if marker_idx != -1:
-                raw_response = decoded[marker_idx + len(RESPONSE_MARKER):].strip()
+                raw_response = decoded[marker_idx + len(RESPONSE_MARKER):]
             else:
                 # Fallback: strip the prompt text
-                clean_prompt = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                raw_response = decoded[len(clean_prompt):].strip()
+                prompt_decoded = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
+                raw_response = decoded[len(prompt_decoded):]
+
+            # Remove eos token if present
+            if self.tokenizer.eos_token:
+                raw_response = raw_response.replace(self.tokenizer.eos_token, "")
+            raw_response = raw_response.strip()
 
             # Attempt to parse JSON
             import json as _json
