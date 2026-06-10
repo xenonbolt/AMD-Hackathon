@@ -165,6 +165,68 @@ class InferenceEngine:
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
 
+    @staticmethod
+    def _resolve_adapter_path(adapter_path: Path) -> Path:
+        """
+        Returns the directory that actually contains ``adapter_config.json``.
+
+        Resolution order
+        ----------------
+        1. ``adapter_path`` itself — the normal case after successful training.
+        2. Latest ``checkpoint-N`` sub-directory — created by the Trainer's
+           step-based saving; used when training was interrupted before the
+           explicit ``save_adapter()`` call at the end of ``fine_tune.py``.
+
+        Raises
+        ------
+        FileNotFoundError
+            With a clear, actionable message when no valid adapter can be found.
+        """
+        # Case 1: root directory has adapter_config.json
+        if (adapter_path / "adapter_config.json").exists():
+            logger.info("Adapter found at: %s", adapter_path)
+            return adapter_path
+
+        # Case 2: look for checkpoint sub-directories
+        if adapter_path.is_dir():
+            checkpoints = sorted(
+                [
+                    d for d in adapter_path.iterdir()
+                    if d.is_dir()
+                    and d.name.startswith("checkpoint-")
+                    and (d / "adapter_config.json").exists()
+                ],
+                key=lambda d: int(d.name.split("-")[-1]),
+            )
+            if checkpoints:
+                latest = checkpoints[-1]
+                logger.warning(
+                    "adapter_config.json not found in root '%s'. "
+                    "Using latest checkpoint: %s",
+                    adapter_path,
+                    latest,
+                )
+                return latest
+
+        # Nothing found — provide a clear, actionable error
+        contents = (
+            [p.name for p in adapter_path.iterdir()]
+            if adapter_path.is_dir()
+            else ["<directory does not exist>"]
+        )
+        raise FileNotFoundError(
+            f"\n\n{'='*60}\n"
+            f"  adapter_config.json NOT FOUND\n"
+            f"{'='*60}\n"
+            f"  Looked in  : {adapter_path.resolve()}\n"
+            f"  Contents   : {contents}\n\n"
+            f"  This means fine-tuning has not completed successfully yet,\n"
+            f"  or the --adapter path is wrong.\n\n"
+            f"  To train the model, run:\n"
+            f"    python3 fine_tune.py --output-dir {adapter_path}\n"
+            f"{'='*60}\n"
+        )
+
     def _load(self) -> None:
         """
         Loads base model + LoRA adapter and tokeniser into memory.
@@ -175,10 +237,8 @@ class InferenceEngine:
         logger.info("  Adapter dir : %s", self.adapter_path)
         logger.info("  Device      : %s", self._device)
 
-        if not self.adapter_path.exists():
-            raise FileNotFoundError(
-                f"Adapter directory not found: {self.adapter_path}"
-            )
+        # Resolve (and validate) the adapter path before loading anything
+        self.adapter_path = self._resolve_adapter_path(self.adapter_path)
 
         # --- Tokeniser --------------------------------------------------
         # Prefer loading from the adapter directory (saved there by fine_tune.py);
