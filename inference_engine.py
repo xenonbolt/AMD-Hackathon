@@ -108,9 +108,9 @@ class VulnerabilityInferenceEngine:
     def analyze_snippet(
         self,
         code: str,
-        max_new_tokens: int = 384,
+        max_new_tokens: int = 1024,
         rag_context: str = "",
-    ) -> Dict:
+    ) -> dict:
         """
         Runs detection inference on a Java code snippet.
 
@@ -180,15 +180,21 @@ class VulnerabilityInferenceEngine:
 
             # Attempt to parse JSON
             import json as _json
+            import re
             parse_error = False
             vulnerabilities = []
+            
+            # Clean up potential markdown code blocks
+            clean_response = re.sub(r"^```(?:json)?", "", raw_response, flags=re.IGNORECASE).strip()
+            clean_response = re.sub(r"```$", "", clean_response).strip()
+            
             try:
                 # The model may emit extra text after the closing brace;
                 # find the outermost JSON object.
-                brace_start = raw_response.find("{")
-                brace_end   = raw_response.rfind("}")
+                brace_start = clean_response.find("{")
+                brace_end   = clean_response.rfind("}")
                 if brace_start != -1 and brace_end != -1:
-                    json_str = raw_response[brace_start: brace_end + 1]
+                    json_str = clean_response[brace_start: brace_end + 1]
                     parsed   = _json.loads(json_str)
                     vulnerabilities = parsed.get("vulnerabilities", [])
                 else:
