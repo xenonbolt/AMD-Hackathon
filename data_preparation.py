@@ -14,20 +14,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger("data_preparation")
 
-# Standard prompt templates
+# ── Prompt templates (detection-only) ──────────────────────────────────────────
+# The model is trained to DETECT and CLASSIFY — it does NOT produce a code fix.
+# Response format: vulnerability label, CWE, CVE hint, and severity.
 PROMPT_INSTRUCTION = (
-    "### Instruction: Analyze the following Java code for vulnerabilities. "
-    "If a vulnerability exists, identify it and provide the remediated code.\n\n"
+    "### Instruction: Analyze the following Java code snippet and determine whether "
+    "it contains a security vulnerability. If a vulnerability is detected, identify "
+    "its type, CWE classification, CVE reference (if known), and severity.\n"
+    "Output format:\n"
+    "  VERDICT: <VULNERABLE | SAFE>\n"
+    "  VULNERABILITY_TYPE: <short name, e.g. SQL Injection>\n"
+    "  CWE_ID: <e.g. CWE-89>\n"
+    "  CVE_REFERENCE: <e.g. CVE-2021-12345 or UNKNOWN>\n"
+    "  SEVERITY: <CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN>\n"
+    "  DESCRIPTION: <one-sentence explanation>\n\n"
 )
 INPUT_TEMPLATE = "### Input:\n{vuln_code}\n\n"
-RESPONSE_TEMPLATE = "### Response:\n{fixed_code}"
+RESPONSE_TEMPLATE = (
+    "### Response:\n"
+    "VERDICT: VULNERABLE\n"
+    "VULNERABILITY_TYPE: {cwe_name}\n"
+    "CWE_ID: {cwe_id}\n"
+    "CVE_REFERENCE: {cve_id}\n"
+    "SEVERITY: {severity}\n"
+    "DESCRIPTION: {description}"
+)
 
 
 class JavaVulnerabilityDataset(Dataset):
     """
-    A custom PyTorch Dataset that loads Java vulnerability data from a JSONL file,
-    formats them into instruction-following prompts, and tokenizes them for
-    causal language model training (with prompt label masking).
+    Detection-only PyTorch Dataset.
+
+    Loads Java vulnerability entries from a JSONL file produced by build_dataset.py
+    and formats them into instruction-following prompts for classification training.
+
+    Expected JSONL keys per record:
+        CVE_ID          – CVE identifier (required)
+        CWE_ID          – CWE identifier string, e.g. 'CWE-89'
+        CWE_Number      – numeric portion of CWE, e.g. '89'
+        Vulnerable_code – Java source snippet that is vulnerable (required)
+        cwe_name        – human-readable CWE name / short description
+        cvss_score      – CVSS base score (float or null)
+        severity        – CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN
+        commit_message  – git commit message (optional context)
+        repo_url        – source repository URL
+        language        – should be 'java'
+
+    The model is NOT trained to produce a code fix — it learns to classify
+    the vulnerability type, CWE, CVE reference, and severity.
     """
     def __init__(
         self,
@@ -37,14 +71,12 @@ class JavaVulnerabilityDataset(Dataset):
         mask_prompt: bool = True
     ) -> None:
         """
-        Initializes the dataset.
-        
         Args:
-            jsonl_path: Path to the JSONL dataset.
+            jsonl_path: Path to the JSONL dataset (from build_dataset.py).
             tokenizer: Pretrained tokenizer from Hugging Face.
             max_length: Maximum token sequence length for truncation.
-            mask_prompt: If True, prompt tokens will be set to -100 in labels so the loss is computed 
-                         only on the response tokens.
+            mask_prompt: If True, prompt tokens are masked (-100) so the loss
+                         is computed only on the response (classification) tokens.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -52,26 +84,45 @@ class JavaVulnerabilityDataset(Dataset):
         self.examples: List[Dict[str, str]] = []
 
         try:
-            logger.info(f"Loading dataset from {jsonl_path}")
+            logger.info(f"Loading detection-only dataset from {jsonl_path}")
             with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line_idx, line in enumerate(f):
                     if not line.strip():
                         continue
                     try:
                         data = json.loads(line)
-                        if "vuln_code" in data and "fixed_code" in data:
-                            self.examples.append({
-                                "vuln_code": data["vuln_code"],
-                                "fixed_code": data["fixed_code"],
-                                "description": data.get("description", "")
-                            })
-                        else:
+
+                        # Support both old key (vuln_code) and new key (Vulnerable_code)
+                        vuln_code = (
+                            data.get("Vulnerable_code")
+                            or data.get("vuln_code")
+                            or ""
+                        ).strip()
+
+                        cve_id = str(data.get("CVE_ID", "UNKNOWN")).strip()
+
+                        if not vuln_code or not cve_id or cve_id.lower() == "unknown":
                             logger.warning(
-                                f"Skipping line {line_idx + 1}: Missing 'vuln_code' or 'fixed_code'"
+                                f"Skipping line {line_idx + 1}: "
+                                f"Missing 'Vulnerable_code' or 'CVE_ID'"
                             )
+                            continue
+
+                        self.examples.append({
+                            "vuln_code": vuln_code,
+                            "cve_id": cve_id,
+                            "cwe_id": str(data.get("CWE_ID", "UNKNOWN")).strip(),
+                            "cwe_number": str(data.get("CWE_Number", "")).strip(),
+                            "cwe_name": str(data.get("cwe_name", "Security Vulnerability")).strip(),
+                            "severity": str(data.get("severity", "UNKNOWN")).strip().upper() or "UNKNOWN",
+                            "cvss_score": data.get("cvss_score"),
+                            "commit_message": str(data.get("commit_message", "")).strip(),
+                        })
+
                     except json.JSONDecodeError as e:
                         logger.error(f"Error parsing JSON on line {line_idx + 1}: {e}")
-            logger.info(f"Loaded {len(self.examples)} records successfully.")
+
+            logger.info(f"Loaded {len(self.examples)} detection records successfully.")
         except Exception as e:
             logger.error(f"Failed to read dataset from {jsonl_path}: {e}")
             raise
@@ -81,17 +132,42 @@ class JavaVulnerabilityDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Prepares a single training sample by formatting the prompt,
-        tokenizing, padding/truncating, and establishing labels.
+        Prepares a single detection-only training sample.
+
+        The prompt instructs the model to classify the vulnerability.
+        The response is a structured label block (VERDICT, CWE_ID, CVE_REFERENCE, etc.).
+        No code fix is included in the response.
         """
         example = self.examples[idx]
         vuln_code = example["vuln_code"]
-        fixed_code = example["fixed_code"]
 
-        # 1. Format the instruction/input prompt (excluding response)
-        prompt_text = f"{PROMPT_INSTRUCTION}{INPUT_TEMPLATE.format(vuln_code=vuln_code)}### Response:\n"
-        # 2. Format the target response
-        response_text = fixed_code
+        # Build a short, informative description from available metadata
+        cwe_name = example.get("cwe_name") or "Security Vulnerability"
+        cvss_score = example.get("cvss_score")
+        description_parts = [f"{cwe_name} vulnerability detected in Java code."]
+        if cvss_score is not None:
+            description_parts.append(f"CVSS Score: {cvss_score}.")
+        commit_msg = example.get("commit_message", "")
+        if commit_msg:
+            # First sentence of commit message as extra context (max 120 chars)
+            first_sentence = commit_msg.split(".")[0][:120]
+            description_parts.append(first_sentence)
+        description = " ".join(description_parts)
+
+        # 1. Format the instruction/input prompt
+        prompt_text = (
+            f"{PROMPT_INSTRUCTION}"
+            f"{INPUT_TEMPLATE.format(vuln_code=vuln_code)}"
+            f"### Response:\n"
+        )
+        # 2. Format the classification response (detection label — no fix)
+        response_text = RESPONSE_TEMPLATE.format(
+            cwe_name=example.get("cwe_name", "Security Vulnerability"),
+            cwe_id=example.get("cwe_id", "UNKNOWN"),
+            cve_id=example.get("cve_id", "UNKNOWN"),
+            severity=example.get("severity", "UNKNOWN"),
+            description=description,
+        )
 
         try:
             # Tokenize the prompt and response separately
@@ -216,25 +292,52 @@ class CausalLMDataCollator:
 
 def generate_mock_jsonl(path: Path) -> None:
     """
-    Generates a sample JSONL file containing mock Java vulnerability examples
-    for verification and testing purposes.
+    Generates a sample JSONL file with mock detection-only Java vulnerability
+    records matching the schema produced by build_dataset.py.
+    Used for verification and testing of data_preparation.py.
     """
     mock_data = [
         {
-            "vuln_code": "public void process(String input) throws Exception {\n    Connection conn = DriverManager.getConnection(DB_URL);\n    Statement stmt = conn.createStatement();\n    ResultSet rs = stmt.executeQuery(\"SELECT * FROM users WHERE username = '\" + input + \"'\");\n}",
-            "description": "SQL Injection vulnerability due to dynamic query building.",
-            "fixed_code": "public void process(String input) throws Exception {\n    Connection conn = DriverManager.getConnection(DB_URL);\n    String sql = \"SELECT * FROM users WHERE username = ?\";\n    PreparedStatement stmt = conn.prepareStatement(sql);\n    stmt.setString(1, input);\n    ResultSet rs = stmt.executeQuery();\n}"
+            "CVE_ID": "CVE-2021-99001",
+            "CWE_ID": "CWE-89",
+            "CWE_Number": "89",
+            "Vulnerable_code": (
+                'public void process(String input) throws Exception {\n'
+                '    Connection conn = DriverManager.getConnection(DB_URL);\n'
+                '    Statement stmt = conn.createStatement();\n'
+                '    ResultSet rs = stmt.executeQuery("SELECT * FROM users WHERE username = \'" + input + "\'");\n'
+                '}'
+            ),
+            "cwe_name": "SQL Injection",
+            "cvss_score": 9.8,
+            "severity": "CRITICAL",
+            "commit_message": "Fix SQL injection by using PreparedStatement.",
+            "repo_url": "https://github.com/example/mock-repo",
+            "language": "java",
         },
         {
-            "vuln_code": "public void handle(HttpServletRequest req) {\n    String path = req.getParameter(\"path\");\n    File file = new File(\"/var/uploads/\" + path);\n    FileInputStream fis = new FileInputStream(file);\n}",
-            "description": "Path Traversal vulnerability via uncontrolled parameters.",
-            "fixed_code": "public void handle(HttpServletRequest req) {\n    String path = req.getParameter(\"path\");\n    File file = new File(\"/var/uploads/\" + path);\n    String canonicalPath = file.getCanonicalPath();\n    if (!canonicalPath.startsWith(\"/var/uploads/\")) {\n        throw new SecurityException(\"Unauthorized path access\");\n    }\n    FileInputStream fis = new FileInputStream(file);\n}"
-        }
+            "CVE_ID": "CVE-2022-99002",
+            "CWE_ID": "CWE-22",
+            "CWE_Number": "22",
+            "Vulnerable_code": (
+                'public void handle(HttpServletRequest req) {\n'
+                '    String path = req.getParameter("path");\n'
+                '    File file = new File("/var/uploads/" + path);\n'
+                '    FileInputStream fis = new FileInputStream(file);\n'
+                '}'
+            ),
+            "cwe_name": "Path Traversal",
+            "cvss_score": 7.5,
+            "severity": "HIGH",
+            "commit_message": "Sanitize file path to prevent directory traversal.",
+            "repo_url": "https://github.com/example/mock-repo",
+            "language": "java",
+        },
     ]
     with open(path, "w", encoding="utf-8") as f:
         for entry in mock_data:
             f.write(json.dumps(entry) + "\n")
-    logger.info(f"Generated mock JSONL dataset at: {path}")
+    logger.info(f"Generated mock detection-only JSONL dataset at: {path}")
 
 
 if __name__ == "__main__":
@@ -254,21 +357,25 @@ if __name__ == "__main__":
         logger.info(f"Loading local/remote tokenizer: {args.tokenizer_name}")
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
         
-        # Instantiate dataset
+        # Instantiate detection-only dataset
         dataset = JavaVulnerabilityDataset(test_path, tokenizer, max_length=512)
         collator = CausalLMDataCollator(tokenizer)
-        
+
         # Test loading first element
         sample = dataset[0]
-        logger.info("Successfully processed first dataset sample.")
-        logger.info(f"Input IDs shape: {sample['input_ids'].shape}")
-        logger.info(f"Labels shape: {sample['labels'].shape}")
+        logger.info("Successfully processed first detection dataset sample.")
+        logger.info(f"Input IDs shape : {sample['input_ids'].shape}")
+        logger.info(f"Labels shape    : {sample['labels'].shape}")
+
+        # Decode to sanity-check the formatted prompt + response
+        decoded = tokenizer.decode(sample['input_ids'], skip_special_tokens=True)
+        logger.info(f"Sample preview  :\n{decoded[:600]}")
 
         # Test batching via data collator
         batch = collator([dataset[0], dataset[1]])
-        logger.info("Successfully batched dataset samples.")
+        logger.info("Successfully batched detection dataset samples.")
         logger.info(f"Batch Input IDs shape: {batch['input_ids'].shape}")
-        logger.info(f"Batch Labels shape: {batch['labels'].shape}")
+        logger.info(f"Batch Labels shape   : {batch['labels'].shape}")
 
     except Exception as err:
         logger.error(f"Verification execution failed: {err}")

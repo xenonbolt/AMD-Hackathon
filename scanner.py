@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional
 
 from inference_engine import VulnerabilityInferenceEngine
 
@@ -13,6 +13,17 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("scanner")
+
+# Attempt to import RAG pipeline; gracefully degrade if unavailable
+try:
+    from rag_pipeline import JavaVulnRAGPipeline
+    _RAG_AVAILABLE = True
+except ImportError:
+    _RAG_AVAILABLE = False
+    logger.warning(
+        "rag_pipeline module not found — CVE/CWE enrichment will be skipped. "
+        "Run: pip install requests"
+    )
 
 
 def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
@@ -179,16 +190,75 @@ def chunk_sliding_window(text: str, start_line: int, window_size: int = 60, over
     return chunks
 
 
+def _enrich_with_rag(
+    rag_pipeline: Any,
+    model_output: str,
+    code_snippet: str,
+) -> Dict[str, Any]:
+    """
+    Uses the RAG pipeline to look up CVE/CWE details relevant to the
+    detected vulnerability based on keywords in the model output.
+
+    Returns a dict with keys: cve_details, cwe_details, severity.
+    """
+    if rag_pipeline is None:
+        return {"cve_details": [], "cwe_details": [], "severity": "UNKNOWN"}
+
+    # Build a retrieval query from the model output + code snippet excerpt
+    combined_query = f"{model_output[:300]} {code_snippet[:200]}"
+    try:
+        results = rag_pipeline.query(combined_query, top_k=3)
+    except Exception as exc:
+        logger.warning(f"RAG retrieval failed: {exc}")
+        return {"cve_details": [], "cwe_details": [], "severity": "UNKNOWN"}
+
+    cve_details: List[Dict[str, Any]] = []
+    cwe_details: List[Dict[str, Any]] = []
+    top_severity = "UNKNOWN"
+    severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "UNKNOWN": 1}
+
+    for doc in results:
+        if doc.get("type") == "CVE":
+            cve_details.append({
+                "cve_id": doc.get("cve_id", ""),
+                "description": doc.get("description", "")[:300],
+                "cvss_score": doc.get("cvss_score"),
+                "severity": doc.get("severity", "UNKNOWN"),
+                "cwe_ids": doc.get("cwe_ids", []),
+                "published": doc.get("published", "")[:10],
+            })
+            sev = doc.get("severity", "UNKNOWN").upper()
+            if severity_rank.get(sev, 0) > severity_rank.get(top_severity, 0):
+                top_severity = sev
+        elif doc.get("type") == "CWE":
+            cwe_details.append({
+                "cwe_id": doc.get("cwe_id", ""),
+                "name": doc.get("name", ""),
+                "description": doc.get("description", "")[:300],
+                "url": doc.get("url", ""),
+            })
+
+    return {
+        "cve_details": cve_details,
+        "cwe_details": cwe_details,
+        "severity": top_severity,
+    }
+
+
 def run_codebase_scan(
     model_id: str,
     adapter_path: str,
     target_dir: str,
     output_report: str,
-    max_chunk_lines: int = 100
+    max_chunk_lines: int = 100,
+    use_rag: bool = True,
+    nvd_api_key: Optional[str] = None,
+    force_rag_refresh: bool = False,
 ) -> None:
     """
-    Walks target codebase, extracts chunks, runs them through the inference engine, 
-    and saves a structured JSON vulnerability report.
+    Walks target codebase, extracts chunks, runs them through the inference engine,
+    and saves a structured JSON vulnerability report enriched with CVE/CWE
+    metadata and severity from the RAG pipeline.
     """
     target_path = Path(target_dir)
     if not target_path.exists():
@@ -206,6 +276,21 @@ def run_codebase_scan(
     except Exception as e:
         logger.error(f"Failed to load model context: {e}", exc_info=True)
         return
+
+    # Initialize RAG pipeline for CVE/CWE enrichment
+    rag_pipeline = None
+    if use_rag and _RAG_AVAILABLE:
+        try:
+            logger.info("Initializing RAG pipeline for CVE/CWE enrichment …")
+            rag_pipeline = JavaVulnRAGPipeline(
+                nvd_api_key=nvd_api_key,
+                force_refresh=force_rag_refresh,
+            )
+            logger.info("RAG pipeline ready.")
+        except Exception as rag_err:
+            logger.warning(f"RAG pipeline failed to initialize: {rag_err}. Continuing without enrichment.")
+    elif use_rag and not _RAG_AVAILABLE:
+        logger.warning("RAG requested but rag_pipeline module is unavailable.")
 
     findings: List[Dict[str, Any]] = []
 
@@ -245,38 +330,46 @@ def run_codebase_scan(
             for chunk in processed_chunks:
                 original_code = chunk["content"]
                 result = engine.analyze_snippet(original_code)
-                
-                # Deduce if a vulnerability is flagged
-                # Clean whitespace/formatting to avoid false positives in change detection
-                clean_orig = "".join(original_code.split())
-                clean_res = "".join(result.split())
-                
-                # If remediation code differs or mentions vulnerability terms
+
+                # Detection-only model: parse the structured VERDICT field.
+                # Expected output contains a line like "VERDICT: VULNERABLE" or "VERDICT: SAFE".
                 vulnerability_found = False
-                vulnerability_keywords = ["vuln", "vulnerability", "remediation", "exploit", "unsafe", "security"]
-                
-                if clean_orig != clean_res:
-                    # Verify it's not a generic response saying "no vulnerability"
-                    lower_res = result.lower()
-                    if not any(phrase in lower_res for phrase in ["no vulnerability", "secure", "safe code", "no issues"]):
-                        vulnerability_found = True
+                lower_res = result.lower()
+
+                # Primary signal: explicit VERDICT field
+                if "verdict:" in lower_res:
+                    verdict_line = next(
+                        (ln for ln in result.splitlines() if "verdict:" in ln.lower()),
+                        ""
+                    )
+                    verdict_value = verdict_line.split(":", 1)[-1].strip().upper()
+                    vulnerability_found = "VULNERABLE" in verdict_value
                 else:
-                    # Check if output contains explicit vulnerability explanations without rewriting
-                    if any(kw in result.lower() for kw in vulnerability_keywords) and "no vulnerability" not in result.lower():
-                        vulnerability_found = True
+                    # Fallback: keyword heuristic for models that deviate from the format
+                    vuln_keywords = ["vulnerable", "vulnerability", "exploit", "unsafe", "cwe-", "injection", "traversal"]
+                    safe_phrases = ["safe", "no vulnerability", "secure", "no issues"]
+                    has_vuln_signal = any(kw in lower_res for kw in vuln_keywords)
+                    has_safe_signal = any(ph in lower_res for ph in safe_phrases)
+                    vulnerability_found = has_vuln_signal and not has_safe_signal
 
                 if vulnerability_found:
                     logger.warning(
                         f"SUSPECTED VULNERABILITY flagged in {file_path.name} "
                         f"(Lines {chunk['start_line']}-{chunk['end_line']})"
                     )
+
+                    # Enrich with CVE/CWE details and severity via RAG
+                    rag_enrichment = _enrich_with_rag(rag_pipeline, result, original_code)
+
                     findings.append({
                         "file_path": str(file_path.relative_to(target_path.parent)),
                         "start_line": chunk["start_line"],
                         "end_line": chunk["end_line"],
-                        "suspected_vulnerability": "Flagged by model inference",
+                        "suspected_vulnerability": result.strip()[:500] if result else "Flagged by model inference",
+                        "severity": rag_enrichment["severity"],
                         "original_code": original_code,
-                        "suggested_remediation": result
+                        "cve_details": rag_enrichment["cve_details"],
+                        "cwe_details": rag_enrichment["cwe_details"],
                     })
 
         except Exception as file_err:
@@ -305,6 +398,9 @@ if __name__ == "__main__":
     parser.add_argument("--target_dir", type=str, required=True, help="Path to directory containing Java source files")
     parser.add_argument("--output_report", type=str, default="vulnerability_report.json", help="Path for JSON output report")
     parser.add_argument("--max_chunk_lines", type=int, default=100, help="Maximum lines of code per chunk")
+    parser.add_argument("--no_rag", action="store_true", help="Disable RAG-based CVE/CWE enrichment")
+    parser.add_argument("--nvd_api_key", type=str, default=None, help="Optional NVD API key for higher rate limits")
+    parser.add_argument("--rag_refresh", action="store_true", help="Force refresh of RAG CVE/CWE caches")
     args = parser.parse_args()
 
     run_codebase_scan(
@@ -312,5 +408,8 @@ if __name__ == "__main__":
         adapter_path=args.adapter_path,
         target_dir=args.target_dir,
         output_report=args.output_report,
-        max_chunk_lines=args.max_chunk_lines
+        max_chunk_lines=args.max_chunk_lines,
+        use_rag=not args.no_rag,
+        nvd_api_key=args.nvd_api_key,
+        force_rag_refresh=args.rag_refresh,
     )

@@ -15,8 +15,16 @@ logging.basicConfig(
 logger = logging.getLogger("inference_engine")
 
 PROMPT_TEMPLATE = (
-    "### Instruction: Analyze the following Java code for vulnerabilities. "
-    "If a vulnerability exists, identify it and provide the remediated code.\n\n"
+    "### Instruction: Analyze the following Java code snippet and determine whether "
+    "it contains a security vulnerability. If a vulnerability is detected, identify "
+    "its type, CWE classification, CVE reference (if known), and severity.\n"
+    "Output format:\n"
+    "  VERDICT: <VULNERABLE | SAFE>\n"
+    "  VULNERABILITY_TYPE: <short name, e.g. SQL Injection>\n"
+    "  CWE_ID: <e.g. CWE-89>\n"
+    "  CVE_REFERENCE: <e.g. CVE-2021-12345 or UNKNOWN>\n"
+    "  SEVERITY: <CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN>\n"
+    "  DESCRIPTION: <one-sentence explanation>\n\n"
     "### Input:\n{vuln_code}\n\n"
     "### Response:\n"
 )
@@ -94,16 +102,26 @@ class VulnerabilityInferenceEngine:
             logger.error(f"Failed to initialize Inference Engine: {e}", exc_info=True)
             raise
 
-    def analyze_snippet(self, code: str, max_new_tokens: int = 512) -> str:
+    def analyze_snippet(self, code: str, max_new_tokens: int = 256) -> str:
         """
-        Executes analysis on a Java code snippet using deterministic (greedy) decoding.
+        Executes detection analysis on a Java code snippet using deterministic
+        (greedy) decoding.
+
+        The model produces a structured classification response:
+            VERDICT: VULNERABLE | SAFE
+            VULNERABILITY_TYPE: ...
+            CWE_ID: ...
+            CVE_REFERENCE: ...
+            SEVERITY: ...
+            DESCRIPTION: ...
 
         Args:
             code: Java source code snippet to analyze.
             max_new_tokens: Maximum number of response tokens to generate.
+                            256 is sufficient for the structured label output.
 
         Returns:
-            Extracted remediation text / output from the model.
+            Raw structured detection text from the model.
         """
         try:
             # Construct exact prompt template matching training
@@ -172,11 +190,11 @@ if __name__ == "__main__":
         logger.info("Running deterministic snippet analysis...")
         result = engine.analyze_snippet(code_content)
 
-        print("\n" + "=" * 50)
-        print("INFERENCE RUN REPORT:")
-        print("=" * 50)
+        print("\n" + "=" * 60)
+        print("VULNERABILITY DETECTION REPORT:")
+        print("=" * 60)
         print(result)
-        print("=" * 50 + "\n")
+        print("=" * 60 + "\n")
 
     except Exception as err:
         logger.error(f"Inference run failed: {err}")
