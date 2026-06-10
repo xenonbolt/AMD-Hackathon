@@ -150,7 +150,7 @@ def run_training(
             lr_scheduler_type="cosine",
             logging_steps=10,
             save_strategy="epoch",
-            evaluation_strategy="epoch" if eval_dataset else "no",
+            eval_strategy="epoch" if eval_dataset else "no",
             bf16=(compute_dtype == torch.bfloat16),
             fp16=(compute_dtype == torch.float16),
             optim="paged_adamw_8bit",
