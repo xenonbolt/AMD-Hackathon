@@ -28,6 +28,7 @@ Python : 3.10+
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -92,8 +93,8 @@ class QuantisationConfig:
 class LoRAHyperParams:
     """Low-Rank Adaptation hyper-parameters."""
 
-    r: int = 16                          # LoRA rank
-    lora_alpha: int = 32                 # Scaling factor (alpha / r = 2)
+    r: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.05
     bias: str = "none"
     # Target all attention + MLP linear projections
@@ -116,39 +117,47 @@ class FinetuneConfig:
     num_epochs: int = 3
     per_device_train_batch_size: int = 2
     per_device_eval_batch_size: int = 2
-    gradient_accumulation_steps: int = 8   # effective batch = 16
+    gradient_accumulation_steps: int = 8
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03
     val_split: float = 0.10
     seed: int = 42
     fp16: bool = False
-    bf16: bool = True          # Use BF16 on Ampere+ GPUs
+    bf16: bool = True
     logging_steps: int = 10
-    save_strategy: str = "epoch"
-    eval_strategy: str = "epoch"
-    load_best_model_at_end: bool = True
-    metric_for_best_model: str = "eval_loss"
-    greater_is_better: bool = False
+    # NOTE: save_strategy and eval_strategy are "steps" by default here
+    # because "epoch"-level saving with load_best_model_at_end=True can
+    # conflict with PEFT adapter-only saves. We save the final adapter
+    # explicitly after training instead.
+    save_strategy: str = "steps"
+    save_steps: int = 200
+    eval_strategy: str = "steps"
+    eval_steps: int = 200
+    save_total_limit: int = 2
+    # Disabled: avoids Trainer trying to reload a PEFT checkpoint
+    load_best_model_at_end: bool = False
     gradient_checkpointing: bool = True
-    group_by_length: bool = True          # Reduces padding waste
-    report_to: str = "none"              # Set to "wandb" / "tensorboard" as needed
+    group_by_length: bool = True
+    report_to: str = "none"
     trust_remote_code: bool = True
 
 
 # ---------------------------------------------------------------------------
-# Cosine Annealing LR scheduler (custom callback)
+# Cosine Annealing LR callback
 # ---------------------------------------------------------------------------
 
 class CosineAnnealingCallback(TrainerCallback):
     """
-    Injects a ``CosineAnnealingLR`` scheduler into the Trainer.
+    Attaches a ``CosineAnnealingLR`` scheduler to the Trainer's optimizer.
 
-    The Trainer creates its own scheduler by default; we override it in
-    ``on_train_begin`` to replace it with our cosine variant.
+    The HF Trainer already sets ``lr_scheduler_type="cosine"`` in
+    TrainingArguments, but this callback provides an explicit
+    PyTorch-native ``CosineAnnealingLR`` handle for full control
+    over T_max and eta_min.
     """
 
-    def __init__(self, t_max: int, eta_min: float = 1e-6) -> None:
+    def __init__(self, t_max: int, eta_min: float = 1e-7) -> None:
         self.t_max = t_max
         self.eta_min = eta_min
         self._scheduler: torch.optim.lr_scheduler.CosineAnnealingLR | None = None
@@ -162,7 +171,7 @@ class CosineAnnealingCallback(TrainerCallback):
     ) -> None:
         optimizer = kwargs.get("optimizer")
         if optimizer is None:
-            logger.warning("CosineAnnealingCallback: no optimizer found; skipping.")
+            logger.warning("CosineAnnealingCallback: optimizer not available yet; skipping.")
             return
         self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -170,7 +179,7 @@ class CosineAnnealingCallback(TrainerCallback):
             eta_min=self.eta_min,
         )
         logger.info(
-            "CosineAnnealingLR scheduler initialised (T_max=%d, eta_min=%.2e).",
+            "CosineAnnealingLR initialised (T_max=%d, eta_min=%.2e).",
             self.t_max,
             self.eta_min,
         )
@@ -187,7 +196,7 @@ class CosineAnnealingCallback(TrainerCallback):
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# Model loading helpers
 # ---------------------------------------------------------------------------
 
 def build_bnb_config(q_cfg: QuantisationConfig) -> BitsAndBytesConfig:
@@ -201,12 +210,7 @@ def build_bnb_config(q_cfg: QuantisationConfig) -> BitsAndBytesConfig:
 
 
 def load_tokeniser(model_id: str, trust_remote_code: bool = True) -> PreTrainedTokenizerBase:
-    """
-    Loads and configures the tokeniser.
-
-    Sets ``pad_token = eos_token`` when no pad token is defined (common for
-    decoder-only models) and uses right-side padding for causal LMs.
-    """
+    """Loads and configures the tokeniser with right-padding for causal LM training."""
     logger.info("Loading tokeniser from: %s", model_id)
     try:
         tokeniser = AutoTokenizer.from_pretrained(
@@ -230,26 +234,28 @@ def load_base_model(
     trust_remote_code: bool = True,
 ) -> PreTrainedModel:
     """
-    Loads the causal LM in 4-bit quantisation onto the available device.
+    Loads the causal LM in 4-bit NF4 quantisation.
 
-    Disables the ``cache`` mechanism (incompatible with gradient checkpointing)
-    and sets ``use_reentrant=False`` for memory-efficient backward passes.
+    ``use_cache=False`` is required when gradient checkpointing is enabled.
     """
-    logger.info("Loading base model from: %s  (4-bit NF4)", model_id)
-    device_map: str | dict = "auto"
-
+    logger.info("Loading base model: %s  (4-bit NF4)", model_id)
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             quantization_config=bnb_config,
-            device_map=device_map,
+            device_map="auto",
             trust_remote_code=trust_remote_code,
             torch_dtype=torch.bfloat16,
-            use_cache=False,   # Required for gradient checkpointing
+            use_cache=False,
         )
         model.config.use_cache = False
-        model.config.pretraining_tp = 1  # Disable tensor parallelism in forward
-        logger.info("Base model loaded successfully. Parameters: %s", model.num_parameters())
+
+        # pretraining_tp only exists on LLaMA-family models; guard safely
+        if hasattr(model.config, "pretraining_tp"):
+            model.config.pretraining_tp = 1
+
+        trainable = sum(p.numel() for p in model.parameters())
+        logger.info("Base model loaded. Total parameters: %s", f"{trainable:,}")
         return model
     except Exception as exc:
         logger.exception("Base model loading failed: %s", exc)
@@ -263,11 +269,8 @@ def apply_lora(
     """
     Prepares the quantised model for k-bit training and wraps it with LoRA.
 
-    Steps
-    -----
-    1. ``prepare_model_for_kbit_training`` – upcasts LayerNorm, enables
-       gradient checkpointing, and freezes non-LoRA weights.
-    2. ``get_peft_model`` – injects trainable LoRA adapters.
+    ``prepare_model_for_kbit_training`` must be called *before*
+    ``get_peft_model`` to correctly upcast LayerNorm weights.
     """
     logger.info("Preparing model for k-bit training …")
     model = prepare_model_for_kbit_training(
@@ -287,18 +290,34 @@ def apply_lora(
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-
     return model
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Training arguments
 # ---------------------------------------------------------------------------
 
 def build_training_arguments(cfg: FinetuneConfig) -> TrainingArguments:
-    """Constructs a fully specified ``TrainingArguments`` object."""
+    """
+    Constructs ``TrainingArguments``.
+
+    Key decisions:
+    - ``save_strategy="steps"`` + ``load_best_model_at_end=False`` avoids
+      the Trainer trying to load a full HF checkpoint on top of a PEFT model,
+      which causes a crash. The final adapter is saved explicitly.
+    - ``optim="paged_adamw_8bit"`` uses bitsandbytes' memory-efficient AdamW.
+    - ``remove_unused_columns=False`` is required because our dataset has
+      pre-built ``input_ids``/``attention_mask``/``labels`` columns.
+    """
+    # Resolve the output directory and create it eagerly so that the
+    # logging_dir sub-path never raises a FileNotFoundError.
+    out = Path(cfg.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "logs").mkdir(parents=True, exist_ok=True)
+    logger.info("Output directory ensured: %s", out.resolve())
+
     return TrainingArguments(
-        output_dir=cfg.output_dir,
+        output_dir=str(out),
         num_train_epochs=cfg.num_epochs,
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         per_device_eval_batch_size=cfg.per_device_eval_batch_size,
@@ -306,47 +325,52 @@ def build_training_arguments(cfg: FinetuneConfig) -> TrainingArguments:
         learning_rate=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
         warmup_ratio=cfg.warmup_ratio,
-        lr_scheduler_type="cosine",      # HF-native cosine; CosineAnnealingCallback overrides it
+        lr_scheduler_type="cosine",
         fp16=cfg.fp16,
         bf16=cfg.bf16,
-        logging_dir=os.path.join(cfg.output_dir, "logs"),
+        logging_dir=str(out / "logs"),
         logging_steps=cfg.logging_steps,
         save_strategy=cfg.save_strategy,
+        save_steps=cfg.save_steps,
         eval_strategy=cfg.eval_strategy,
+        eval_steps=cfg.eval_steps,
+        save_total_limit=cfg.save_total_limit,
         load_best_model_at_end=cfg.load_best_model_at_end,
-        metric_for_best_model=cfg.metric_for_best_model,
-        greater_is_better=cfg.greater_is_better,
         gradient_checkpointing=cfg.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         group_by_length=cfg.group_by_length,
         report_to=cfg.report_to,
         seed=cfg.seed,
         dataloader_num_workers=2,
-        remove_unused_columns=False,     # We manage columns ourselves
-        optim="paged_adamw_8bit",        # Memory-efficient paged AdamW
+        remove_unused_columns=False,
+        optim="paged_adamw_8bit",
         ddp_find_unused_parameters=False,
     )
 
 
+# ---------------------------------------------------------------------------
+# Training orchestration
+# ---------------------------------------------------------------------------
+
 def run_training(cfg: FinetuneConfig) -> None:
     """
-    Orchestrates the full QLoRA fine-tuning pipeline.
+    Runs the full QLoRA fine-tuning pipeline end-to-end.
 
-    Parameters
-    ----------
-    cfg : FinetuneConfig
-        All configuration parameters for this training run.
+    Flow
+    ----
+    tokeniser → dataset → base model (4-bit) → LoRA wrap →
+    Trainer.train() → save_pretrained() (adapter only) → save tokeniser
     """
     logger.info("=== Starting QLoRA Fine-Tuning Pipeline ===")
-    logger.info("Base model    : %s", cfg.base_model)
-    logger.info("Output dir    : %s", cfg.output_dir)
-    logger.info("Epochs        : %d", cfg.num_epochs)
-    logger.info("Max seq len   : %d", cfg.max_seq_length)
+    logger.info("Base model : %s", cfg.base_model)
+    logger.info("Output dir : %s", cfg.output_dir)
+    logger.info("Epochs     : %d", cfg.num_epochs)
+    logger.info("Max seq len: %d", cfg.max_seq_length)
 
-    # --- Tokeniser ---
+    # --- Tokeniser -------------------------------------------------------
     tokeniser = load_tokeniser(cfg.base_model, cfg.trust_remote_code)
 
-    # --- Dataset ---
+    # --- Dataset ---------------------------------------------------------
     tok_config = TokenisationConfig(max_seq_length=cfg.max_seq_length)
     dataset_dict = build_dataset(
         dataset_path=Path(cfg.dataset_path),
@@ -356,94 +380,108 @@ def run_training(cfg: FinetuneConfig) -> None:
         seed=cfg.seed,
     )
 
-    # --- Quantisation config ---
+    # --- Model -----------------------------------------------------------
     q_cfg = QuantisationConfig()
     bnb_config = build_bnb_config(q_cfg)
-
-    # --- Load & prepare model ---
     base_model = load_base_model(cfg.base_model, bnb_config, cfg.trust_remote_code)
     lora_model = apply_lora(base_model, LoRAHyperParams())
 
-    # --- Training arguments ---
+    # --- Training arguments ----------------------------------------------
     training_args = build_training_arguments(cfg)
 
-    # Cosine annealing: T_max = total optimiser steps
+    # Cosine annealing T_max = number of optimiser update steps
     total_steps: int = math.ceil(
         len(dataset_dict["train"])
         / (cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps)
         * cfg.num_epochs
     )
-    cosine_callback = CosineAnnealingCallback(t_max=total_steps, eta_min=1e-7)
+    cosine_cb = CosineAnnealingCallback(t_max=total_steps)
 
-    # Data collator – pads inputs/labels to the batch maximum
+    # --- Data collator ---------------------------------------------------
+    # The dataset is already padded to max_seq_length in data_preparation.py,
+    # so pad_to_multiple_of=8 just enforces alignment; no re-padding occurs
+    # for sequences that are already at max length.
     data_collator = DataCollatorForSeq2Seq(
-        tokeniser=tokeniser,
+        tokenizer=tokeniser,
         model=lora_model,
         label_pad_token_id=-100,
         pad_to_multiple_of=8,
+        padding=True,
     )
 
-    # --- Trainer ---
+    # --- Trainer ---------------------------------------------------------
     trainer = Trainer(
         model=lora_model,
         args=training_args,
         train_dataset=dataset_dict["train"],
         eval_dataset=dataset_dict["validation"],
         data_collator=data_collator,
-        callbacks=[cosine_callback],
+        callbacks=[cosine_cb],
     )
 
-    logger.info("Training configuration ready. Starting training …")
+    logger.info("Launching training …")
     try:
         train_result = trainer.train()
         logger.info("Training complete. Metrics: %s", train_result.metrics)
     except Exception as exc:
-        logger.exception("Training failed with exception: %s", exc)
+        logger.exception("Training loop failed: %s", exc)
         raise
 
-    # --- Save adapter weights and tokeniser ---
-    logger.info("Saving LoRA adapter weights to: %s", cfg.output_dir)
+    # --- Save adapter weights + tokeniser --------------------------------
+    # We call save_pretrained() explicitly rather than relying on the Trainer
+    # so that only the LoRA adapter (not the full base model) is persisted.
+    adapter_save_path = Path(cfg.output_dir)
+    logger.info("Saving LoRA adapter to: %s", adapter_save_path)
     try:
-        lora_model.save_pretrained(cfg.output_dir)
-        tokeniser.save_pretrained(cfg.output_dir)
+        lora_model.save_pretrained(str(adapter_save_path))
+        tokeniser.save_pretrained(str(adapter_save_path))
         logger.info("Adapter weights and tokeniser saved successfully.")
     except Exception as exc:
-        logger.exception("Failed to save adapter weights: %s", exc)
+        logger.exception("save_pretrained() failed: %s", exc)
         raise
 
-    # Save training metrics
-    metrics_path = Path(cfg.output_dir) / "train_metrics.json"
+    # --- Save training metrics -------------------------------------------
+    metrics_path = adapter_save_path / "train_metrics.json"
     try:
-        import json
         with metrics_path.open("w", encoding="utf-8") as fh:
             json.dump(train_result.metrics, fh, indent=2)
-        logger.info("Training metrics saved to: %s", metrics_path)
+        logger.info("Training metrics → %s", metrics_path)
     except OSError as exc:
-        logger.warning("Could not save metrics file: %s", exc)
+        logger.warning("Could not write metrics file: %s", exc)
 
     logger.info("=== Fine-Tuning Pipeline Complete ===")
+    logger.info("Adapter saved to: %s", adapter_save_path.resolve())
 
 
 # ---------------------------------------------------------------------------
-# Argument parsing & entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> FinetuneConfig:
     parser = argparse.ArgumentParser(
         description="QLoRA fine-tuning for Java vulnerability detection."
     )
-    parser.add_argument("--base-model", default="bigcode/starcoder2-3b")
-    parser.add_argument("--dataset", default="Dataset/train_classifier_final.jsonl")
-    parser.add_argument("--output-dir", default="./outputs/vuln-lora")
+    parser.add_argument("--base-model", default="bigcode/starcoder2-3b",
+                        help="HuggingFace model ID (default: bigcode/starcoder2-3b)")
+    parser.add_argument("--dataset", default="Dataset/train_classifier_final.jsonl",
+                        help="Path to the JSONL training dataset")
+    parser.add_argument("--output-dir", default="./outputs/vuln-lora",
+                        help="Directory to save LoRA adapter weights")
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=2,
+                        help="Per-device train batch size")
+    parser.add_argument("--grad-accum", type=int, default=8,
+                        help="Gradient accumulation steps (effective batch = batch-size × grad-accum)")
     parser.add_argument("--val-split", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-steps", type=int, default=200,
+                        help="Save a Trainer checkpoint every N steps")
+    parser.add_argument("--eval-steps", type=int, default=200,
+                        help="Run evaluation every N steps")
     parser.add_argument("--no-bf16", action="store_true",
-                        help="Disable BF16; fall back to FP16 on non-Ampere GPUs.")
+                        help="Disable BF16; use FP16 instead (for non-Ampere GPUs)")
     args = parser.parse_args()
 
     return FinetuneConfig(
@@ -457,6 +495,8 @@ def _parse_args() -> FinetuneConfig:
         gradient_accumulation_steps=args.grad_accum,
         val_split=args.val_split,
         seed=args.seed,
+        save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
         bf16=not args.no_bf16,
         fp16=args.no_bf16,
     )
