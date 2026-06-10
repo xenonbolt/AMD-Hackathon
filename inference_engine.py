@@ -14,27 +14,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("inference_engine")
 
+# ── Prompt templates — must match train_classifier_final.jsonl format ─────────
 PROMPT_TEMPLATE = (
-    "### Instruction: Analyze the following Java code snippet and determine whether "
-    "it contains a security vulnerability. If a vulnerability is detected, identify "
-    "its type, CWE classification, CVE reference (if known), and severity.\n"
-    "Output format:\n"
-    "  VERDICT: <VULNERABLE | SAFE>\n"
-    "  VULNERABILITY_TYPE: <short name, e.g. SQL Injection>\n"
-    "  CWE_ID: <e.g. CWE-89>\n"
-    "  CVE_REFERENCE: <e.g. CVE-2021-12345 or UNKNOWN>\n"
-    "  SEVERITY: <CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN>\n"
-    "  DESCRIPTION: <one-sentence explanation>\n\n"
+    "<|instruction|>\n"
+    "Analyze the Java code and identify ALL security vulnerabilities. "
+    "Return structured JSON only.\n\n"
     "{rag_context}"
-    "### Input:\n{vuln_code}\n\n"
-    "### Response:\n"
+    "<|input|>\n{vuln_code}\n\n"
+    "<|response|>\n"
 )
 
-# Inserted between Instruction and Input when RAG results are available
+# Inserted after the instruction line when RAG results are available
 RAG_CONTEXT_PREFIX = (
-    "### Relevant CVE/CWE Context (use to inform your classification):\n"
+    "Relevant CVE/CWE context (use to inform your classification):\n"
     "{context}\n\n"
 )
+
+RESPONSE_MARKER = "<|response|>"
 
 
 class VulnerabilityInferenceEngine:
@@ -109,43 +105,55 @@ class VulnerabilityInferenceEngine:
             logger.error(f"Failed to initialize Inference Engine: {e}", exc_info=True)
             raise
 
-    def analyze_snippet(self, code: str, max_new_tokens: int = 256, rag_context: str = "") -> str:
+    def analyze_snippet(
+        self,
+        code: str,
+        max_new_tokens: int = 384,
+        rag_context: str = "",
+    ) -> Dict:
         """
-        Executes detection analysis on a Java code snippet using deterministic
-        (greedy) decoding.
+        Runs detection inference on a Java code snippet.
 
-        The model produces a structured classification response:
-            VERDICT: VULNERABLE | SAFE
-            VULNERABILITY_TYPE: ...
-            CWE_ID: ...
-            CVE_REFERENCE: ...
-            SEVERITY: ...
-            DESCRIPTION: ...
+        The model is trained to return a JSON object:
+            {
+              "vulnerabilities": [
+                {
+                  "cwe_id": "CWE-89",
+                  "cwe_name": "...",
+                  "severity": "critical" | "high" | "medium" | "low",
+                  "confidence": 0.0–1.0,
+                  "location": {"start_line": N, "end_line": N, "function": "..."},
+                  "description": "...",
+                  "impact": "...",
+                  "recommendation": "..."
+                }
+              ]
+            }
+
+        An empty ``vulnerabilities`` list means the code is considered safe.
 
         Args:
-            code: Java source code snippet to analyze.
-            max_new_tokens: Maximum number of response tokens to generate.
-                            256 is sufficient for the structured label output.
-            rag_context: Optional pre-formatted RAG context string (CVE/CWE
-                         intelligence) to inject into the prompt. When provided,
-                         the model uses this grounded knowledge to fill in
-                         CVE_REFERENCE, CWE_ID, and SEVERITY rather than
-                         relying solely on its trained weights.
+            code          : Java source code snippet.
+            max_new_tokens: Cap on generated tokens (384 covers most JSON responses).
+            rag_context   : Optional RAG context string injected into the prompt
+                            before the code, grounding CWE/severity predictions.
 
         Returns:
-            Raw structured detection text from the model.
+            Dict with keys:
+                ``raw``             – raw decoded response string
+                ``vulnerabilities`` – parsed list of vulnerability dicts (may be [])
+                ``parse_error``     – True if JSON decoding failed
         """
         try:
-            # Inject RAG context block if provided
+            # Build RAG context block
             rag_block = ""
             if rag_context and rag_context.strip():
                 rag_block = RAG_CONTEXT_PREFIX.format(context=rag_context.strip())
 
-            # Construct prompt with optional RAG context
             prompt = PROMPT_TEMPLATE.format(vuln_code=code, rag_context=rag_block)
             
             inputs = self.tokenizer(prompt, return_tensors="pt")
-            input_ids = inputs["input_ids"].to(self.model.device)
+            input_ids      = inputs["input_ids"].to(self.model.device)
             attention_mask = inputs["attention_mask"].to(self.model.device)
 
             with torch.no_grad():
@@ -158,22 +166,41 @@ class VulnerabilityInferenceEngine:
                     eos_token_id=self.tokenizer.eos_token_id
                 )
 
-            # Decode complete sequence
-            decoded_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Isolate the response segment from prompt text
-            # In cases where model generated EOS or standard formatting, slice after response header
-            response_marker = "### Response:\n"
-            marker_idx = decoded_output.find(response_marker)
+            # Decode full sequence and isolate the response
+            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+            # Slice off everything up to and including <|response|>
+            marker_idx = decoded.find(RESPONSE_MARKER)
             if marker_idx != -1:
-                response = decoded_output[marker_idx + len(response_marker):].strip()
+                raw_response = decoded[marker_idx + len(RESPONSE_MARKER):].strip()
             else:
-                # Fallback: slice using length of constructed prompt if marker not found cleanly
-                # (Skipping special characters or potential formatting variations)
+                # Fallback: strip the prompt text
                 clean_prompt = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                response = decoded_output[len(clean_prompt):].strip()
-                
-            return response
+                raw_response = decoded[len(clean_prompt):].strip()
+
+            # Attempt to parse JSON
+            import json as _json
+            parse_error = False
+            vulnerabilities = []
+            try:
+                # The model may emit extra text after the closing brace;
+                # find the outermost JSON object.
+                brace_start = raw_response.find("{")
+                brace_end   = raw_response.rfind("}")
+                if brace_start != -1 and brace_end != -1:
+                    json_str = raw_response[brace_start: brace_end + 1]
+                    parsed   = _json.loads(json_str)
+                    vulnerabilities = parsed.get("vulnerabilities", [])
+                else:
+                    parse_error = True
+            except _json.JSONDecodeError:
+                parse_error = True
+
+            return {
+                "raw": raw_response,
+                "vulnerabilities": vulnerabilities,
+                "parse_error": parse_error,
+            }
             
         except Exception as e:
             logger.error(f"Error during analysis of code snippet: {e}", exc_info=True)

@@ -1,8 +1,10 @@
 # Java Vulnerability Detection Pipeline — QLoRA + RAG
 
-A modular, production-ready Python pipeline that fine-tunes a domain-specific LLM (e.g. `bigcode/starcoder2-3b` or `codellama/CodeLlama-7b-hf`) using **QLoRA** to **detect and classify** security vulnerabilities in Java code. A **Retrieval-Augmented Generation (RAG)** layer fetches live CVE/CWE intelligence from NIST NVD and MITRE, injects it directly into the LLM prompt **before inference**, and saves the same retrieved data to the scan report — one RAG call per chunk, zero hallucination.
+A modular, production-ready Python pipeline that fine-tunes a domain-specific LLM (e.g., `bigcode/starcoder2-3b` or `codellama/CodeLlama-7b-hf`) using **QLoRA** to **detect and classify** security vulnerabilities in Java code. 
 
-> **Detection-only by design.** The model outputs a structured `VERDICT / CWE_ID / CVE_REFERENCE / SEVERITY / DESCRIPTION` block. It does **not** generate code fixes.
+A **Retrieval-Augmented Generation (RAG)** layer fetches live CVE/CWE intelligence from NIST NVD and MITRE, injects it directly into the LLM prompt **before inference**, and saves the same retrieved data to the scan report — one RAG call per chunk, zero hallucination.
+
+> **Detection-only by design.** The model outputs a structured JSON `vulnerabilities` array. It does **not** generate code fixes.
 
 ---
 
@@ -11,9 +13,8 @@ A modular, production-ready Python pipeline that fine-tunes a domain-specific LL
 ```mermaid
 flowchart TD
     subgraph Training
-        A["hitoshura25/cvefixes (HuggingFace)"]
-        A -->|build_dataset.py| B["Detection JSONL\n(CVE_ID · CWE_ID · Vulnerable_code · Severity…)"]
-        B -->|data_preparation.py| C[Tokenized Prompt / Label Pairs]
+        A["train_classifier_final.jsonl\n(Instruction-Tuning Format)"]
+        A -->|data_preparation.py| C[Tokenized Prompt / Label Pairs\n(Masked Prompt Loss)]
         C -->|fine_tune.py  QLoRA 4-bit| D[LoRA Adapter Checkpoint]
     end
 
@@ -27,28 +28,12 @@ flowchart TD
         H[Target Java Codebase]
         H -->|scanner.py block extractor| I[Code Chunk]
         I -->|"① query RAG first"| G
-        G -->|"② top-3 CVE/CWE docs\ninjected into prompt"| J["LLM Prompt\n= Instruction + Context + Code"]
+        G -->|"② top-3 CVE/CWE docs\ninjected into prompt"| J["LLM Prompt\n= <|instruction|> + Context + <|input|>"]
         D -->|LoRA adapter| J
-        J -->|inference_engine.py| K["Structured Output\nVERDICT · CWE_ID · CVE_REFERENCE · SEVERITY"]
+        J -->|inference_engine.py| K["Structured JSON Output\n(vulnerabilities array)"]
         G -->|"③ same docs (no 2nd query)"| L[Vulnerability Report JSON]
         K --> L
     end
-```
-
-### Key design decision — RAG before inference
-
-The RAG pipeline is queried **before** the LLM sees the code. Retrieved CVE/CWE facts are injected into the prompt so the model produces **grounded** classifications, not hallucinated IDs. The same retrieved documents are reused directly for the JSON report — no second query needed.
-
-```
-code chunk → RAG query (top-3 docs)
-                 ├─→ compact context block  ──┐
-                 └─→ saved for report data    │
-                                             ▼
-             LLM prompt = Instruction + [CVE/CWE Context] + Code
-                                             ▼
-             VERDICT / VULNERABILITY_TYPE / CWE_ID / CVE_REFERENCE / SEVERITY
-                                             ▼
-                             vulnerability_report.json
 ```
 
 ---
@@ -60,51 +45,42 @@ AMD/
 ├── README.md               — This file
 ├── requirements.txt        — Python dependencies
 │
-├── build_dataset.py        — Downloads hitoshura25/cvefixes, filters Java,
-│                             writes detection-only JSONL to Dataset/
-│
 ├── data_preparation.py     — PyTorch Dataset + DataCollator for QLoRA training
-│                             Loads new JSONL schema, formats detection prompts
+│                             Parses <|instruction|>/<|input|>/<|response|> format
+│                             and masks prompts during training
 │
 ├── fine_tune.py            — QLoRA 4-bit fine-tuning via PEFT + HuggingFace Trainer
 │
 ├── inference_engine.py     — Loads base model + LoRA adapter; analyze_snippet()
-│                             accepts optional rag_context injected into prompt
+│                             injects RAG context and parses JSON model output
 │
 ├── rag_pipeline.py         — Fetches Java CVE/CWE data from NVD + MITRE,
 │                             caches locally (24h TTL), TF-IDF retrieval
 │
 ├── scanner.py              — Recursively scans Java codebases; per chunk:
-│                             (1) queries RAG, (2) injects context into prompt,
-│                             (3) runs inference, (4) saves enriched JSON report
+│                             (1) queries RAG, (2) runs inference,
+│                             (3) saves enriched JSON report
 │
 └── Dataset/
-    ├── java_vuln_dataset.jsonl   — Generated detection dataset
+    ├── train_classifier_final.jsonl  — The instruction-tuning training dataset
     └── rag_cache/
-        ├── java_cves.json        — Cached NVD CVE records  (auto-refresh 24h)
-        └── cwe_catalog.json      — Cached MITRE CWE catalog
+        ├── java_cves.json            — Cached NVD CVE records  (auto-refresh 24h)
+        └── cwe_catalog.json          — Cached MITRE CWE catalog
 ```
 
 ---
 
-## JSONL Dataset Schema
+## Dataset Format
 
-Each record in `Dataset/java_vuln_dataset.jsonl`:
+The pipeline trains on `Dataset/train_classifier_final.jsonl`. Each record must contain a single `"text"` field using the following special tokens format:
 
 ```jsonc
 {
-  "CVE_ID":         "CVE-2021-44228",
-  "CWE_ID":         "CWE-502",
-  "CWE_Number":     "502",
-  "Vulnerable_code": "public void ...",
-  "cwe_name":       "Deserialization of Untrusted Data",
-  "cvss_score":     10.0,
-  "severity":       "CRITICAL",
-  "commit_message": "Fix Log4Shell RCE ...",
-  "repo_url":       "https://github.com/...",
-  "language":       "java"
+  "text": "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. Return structured JSON only.\n\n<|input|>\npublic void process(String input) throws Exception {\n    Statement stmt = conn.createStatement();\n    ResultSet rs = stmt.executeQuery(\n        \"SELECT * FROM users WHERE name = '\" + input + \"'\");\n}\n\n<|response|>\n{\n  \"vulnerabilities\": [\n    {\n      \"cwe_id\": \"CWE-89\",\n      \"cwe_name\": \"SQL Injection (CWE-89)\",\n      \"severity\": \"critical\",\n      \"confidence\": 0.97,\n      \"location\": {\n        \"start_line\": 1,\n        \"end_line\": 5,\n        \"function\": \"process\"\n      },\n      \"description\": \"Unsanitised input concatenated into SQL query.\",\n      \"impact\": \"Data exfiltration or destruction.\",\n      \"recommendation\": \"Use PreparedStatement with parameterised queries.\"\n    }\n  ]\n}"
 }
 ```
+
+*Safe code examples have an empty vulnerabilities array: `{ "vulnerabilities": [] }`.*
 
 ---
 
@@ -113,37 +89,20 @@ Each record in `Dataset/java_vuln_dataset.jsonl`:
 What the model actually receives at inference time:
 
 ```
-### Instruction: Analyze the following Java code snippet and determine whether
-it contains a security vulnerability. If a vulnerability is detected, identify
-its type, CWE classification, CVE reference (if known), and severity.
-Output format:
-  VERDICT: <VULNERABLE | SAFE>
-  VULNERABILITY_TYPE: <short name, e.g. SQL Injection>
-  CWE_ID: <e.g. CWE-89>
-  CVE_REFERENCE: <e.g. CVE-2021-12345 or UNKNOWN>
-  SEVERITY: <CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN>
-  DESCRIPTION: <one-sentence explanation>
+<|instruction|>
+Analyze the Java code and identify ALL security vulnerabilities. Return structured JSON only.
 
-### Relevant CVE/CWE Context (use to inform your classification):
+Relevant CVE/CWE context (use to inform your classification):
 - CVE-2021-99001 | Severity: CRITICAL (CVSS 9.8) | CWE: CWE-89 | SQL injection via...
 - CWE-89: SQL Injection — The software constructs all or part of an SQL command...
 
-### Input:
+<|input|>
 <java code snippet>
 
-### Response:
+<|response|>
 ```
 
-## Model Output Format
-
-```
-VERDICT: VULNERABLE
-VULNERABILITY_TYPE: SQL Injection
-CWE_ID: CWE-89
-CVE_REFERENCE: CVE-2021-99001
-SEVERITY: CRITICAL
-DESCRIPTION: Dynamic query construction using string concatenation allows attacker-controlled SQL execution.
-```
+The model generates the corresponding JSON block directly following the `<|response|>` token.
 
 ---
 
@@ -159,25 +118,20 @@ pip install -r requirements.txt
 
 ## Usage Guide
 
-### Step 1 — Build the Detection Dataset
+### Step 1 — Fine-Tune (QLoRA)
 
-```bash
-python build_dataset.py
-# Output: Dataset/java_vuln_dataset.jsonl
-```
-
-### Step 2 — Fine-Tune (QLoRA)
+Ensure your dataset is at `Dataset/train_classifier_final.jsonl`, then run:
 
 ```bash
 python fine_tune.py \
     --model_id "bigcode/starcoder2-3b" \
-    --dataset_path "Dataset/java_vuln_dataset.jsonl" \
+    --dataset_path "Dataset/train_classifier_final.jsonl" \
     --output_dir "./adapters" \
     --epochs 3 \
     --batch_size 4
 ```
 
-### Step 3 — Run Single Snippet Inference
+### Step 2 — Run Single Snippet Inference
 
 ```bash
 python inference_engine.py \
@@ -186,7 +140,7 @@ python inference_engine.py \
     --snippet_path "path/to/Snippet.java"
 ```
 
-### Step 4 — Scan a Codebase
+### Step 3 — Scan a Codebase
 
 ```bash
 python scanner.py \
@@ -202,9 +156,9 @@ RAG flags:
 |---|---|
 | `--nvd_api_key KEY` | Higher NVD rate limits (recommended) |
 | `--rag_refresh` | Force re-fetch CVE/CWE caches from internet |
-| `--no_rag` | Skip RAG entirely — faster, offline, but ungrounded |
+| `--no_rag` | Skip RAG entirely — faster, offline, but ungrounded predictions |
 
-### Step 5 — RAG Pipeline Standalone
+### Step 4 — RAG Pipeline Standalone
 
 ```bash
 # Query for CVE/CWE context
@@ -229,8 +183,17 @@ python rag_pipeline.py --refresh --nvd_api_key "YOUR_KEY"
   "file_path": "src/main/java/Dao.java",
   "start_line": 42,
   "end_line": 58,
-  "suspected_vulnerability": "VERDICT: VULNERABLE\nVULNERABILITY_TYPE: SQL Injection\nCWE_ID: CWE-89\nCVE_REFERENCE: CVE-2021-99001\nSEVERITY: CRITICAL\nDESCRIPTION: ...",
-  "severity": "CRITICAL",
+  "suspected_vulnerabilities": [
+    {
+      "cwe_id": "CWE-89",
+      "cwe_name": "SQL Injection (CWE-89)",
+      "severity": "critical",
+      "confidence": 0.95,
+      "location": {"start_line": 42, "end_line": 58, "function": "..."}
+      /* ... other JSON fields from model output ... */
+    }
+  ],
+  "rag_severity": "CRITICAL",
   "original_code": "...",
   "cve_details": [
     {

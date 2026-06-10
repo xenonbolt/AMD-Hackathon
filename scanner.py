@@ -340,29 +340,21 @@ def run_codebase_scan(
                         logger.warning(f"RAG pre-inference query failed: {rag_err}")
 
                 # ── Step 2: Run inference WITH RAG context in prompt ─────────────
-                result = engine.analyze_snippet(original_code, rag_context=rag_context_str)
+                result_dict = engine.analyze_snippet(original_code, rag_context=rag_context_str)
 
-                # ── Step 3: Parse VERDICT from structured output ─────────────────
-                vulnerability_found = False
-                lower_res = result.lower()
-
-                # Primary signal: explicit VERDICT field
-                if "verdict:" in lower_res:
-                    verdict_line = next(
-                        (ln for ln in result.splitlines() if "verdict:" in ln.lower()),
-                        ""
+                # ── Step 3: Handle structured JSON output ────────────────────────
+                if result_dict.get("parse_error"):
+                    logger.warning(
+                        f"Failed to parse JSON response for {file_path.name} "
+                        f"(Lines {chunk['start_line']}-{chunk['end_line']}). Raw output:\n"
+                        f"{result_dict.get('raw', '')}"
                     )
-                    verdict_value = verdict_line.split(":", 1)[-1].strip().upper()
-                    vulnerability_found = "VULNERABLE" in verdict_value
-                else:
-                    # Fallback: keyword heuristic for models that deviate from the format
-                    vuln_keywords = ["vulnerable", "vulnerability", "exploit", "unsafe", "cwe-", "injection", "traversal"]
-                    safe_phrases = ["safe", "no vulnerability", "secure", "no issues"]
-                    has_vuln_signal = any(kw in lower_res for kw in vuln_keywords)
-                    has_safe_signal = any(ph in lower_res for ph in safe_phrases)
-                    vulnerability_found = has_vuln_signal and not has_safe_signal
+                    continue
 
-                if vulnerability_found:
+                vulnerabilities = result_dict.get("vulnerabilities", [])
+                
+                # If the vulnerabilities list is not empty, vulnerabilities were found
+                if vulnerabilities:
                     logger.warning(
                         f"SUSPECTED VULNERABILITY flagged in {file_path.name} "
                         f"(Lines {chunk['start_line']}-{chunk['end_line']})"
@@ -372,8 +364,8 @@ def run_codebase_scan(
                         "file_path": str(file_path.relative_to(target_path.parent)),
                         "start_line": chunk["start_line"],
                         "end_line": chunk["end_line"],
-                        "suspected_vulnerability": result.strip()[:500] if result else "Flagged by model inference",
-                        "severity": rag_enrichment["severity"],
+                        "suspected_vulnerabilities": vulnerabilities,
+                        "rag_severity": rag_enrichment["severity"],
                         "original_code": original_code,
                         "cve_details": rag_enrichment["cve_details"],
                         "cwe_details": rag_enrichment["cwe_details"],
