@@ -14,7 +14,7 @@ A **Retrieval-Augmented Generation (RAG)** layer fetches live CVE/CWE intelligen
 flowchart TD
     subgraph Training
         A["train_classifier_final.jsonl\n(Instruction-Tuning Format)"]
-        A -->|data_preparation.py| C[Tokenized Prompt / Label Pairs\n(Masked Prompt Loss)]
+        A -->|data_preparation.py| C["Tokenized Prompt / Label Pairs\n(Masked Prompt Loss)"]
         C -->|fine_tune.py  QLoRA 4-bit| D[LoRA Adapter Checkpoint]
     end
 
@@ -26,7 +26,7 @@ flowchart TD
 
     subgraph Inference
         H[Target Java Codebase]
-        H -->|scanner.py block extractor| I[Code Chunk]
+        H -->|scanner.py block extractor| I["Code Chunk"]
         I -->|"① query RAG first"| G
         G -->|"② top-3 CVE/CWE docs\ninjected into prompt"| J["LLM Prompt\n= <|instruction|> + Context + <|input|>"]
         D -->|LoRA adapter| J
@@ -161,15 +161,18 @@ RAG flags:
 ### Step 4 — RAG Pipeline Standalone
 
 ```bash
-# Query for CVE/CWE context
+# Build/Refresh the RAG cache (without API key — slower due to rate limits)
+python rag_pipeline.py --refresh
+
+# Build/Refresh the RAG cache (with API key — much faster)
+python rag_pipeline.py --refresh --nvd_api_key "YOUR_KEY"
+
+# Query for CVE/CWE context manually
 python rag_pipeline.py --query "SQL injection JDBC PreparedStatement" --top_k 5
 
 # Direct lookups
 python rag_pipeline.py --lookup_cve CVE-2021-44228
 python rag_pipeline.py --lookup_cwe CWE-89
-
-# Force refresh
-python rag_pipeline.py --refresh --nvd_api_key "YOUR_KEY"
 ```
 
 ---
