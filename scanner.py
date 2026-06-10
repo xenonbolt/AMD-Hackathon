@@ -190,59 +190,7 @@ def chunk_sliding_window(text: str, start_line: int, window_size: int = 60, over
     return chunks
 
 
-def _enrich_with_rag(
-    rag_pipeline: Any,
-    model_output: str,
-    code_snippet: str,
-) -> Dict[str, Any]:
-    """
-    Uses the RAG pipeline to look up CVE/CWE details relevant to the
-    detected vulnerability based on keywords in the model output.
 
-    Returns a dict with keys: cve_details, cwe_details, severity.
-    """
-    if rag_pipeline is None:
-        return {"cve_details": [], "cwe_details": [], "severity": "UNKNOWN"}
-
-    # Build a retrieval query from the model output + code snippet excerpt
-    combined_query = f"{model_output[:300]} {code_snippet[:200]}"
-    try:
-        results = rag_pipeline.query(combined_query, top_k=3)
-    except Exception as exc:
-        logger.warning(f"RAG retrieval failed: {exc}")
-        return {"cve_details": [], "cwe_details": [], "severity": "UNKNOWN"}
-
-    cve_details: List[Dict[str, Any]] = []
-    cwe_details: List[Dict[str, Any]] = []
-    top_severity = "UNKNOWN"
-    severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "UNKNOWN": 1}
-
-    for doc in results:
-        if doc.get("type") == "CVE":
-            cve_details.append({
-                "cve_id": doc.get("cve_id", ""),
-                "description": doc.get("description", "")[:300],
-                "cvss_score": doc.get("cvss_score"),
-                "severity": doc.get("severity", "UNKNOWN"),
-                "cwe_ids": doc.get("cwe_ids", []),
-                "published": doc.get("published", "")[:10],
-            })
-            sev = doc.get("severity", "UNKNOWN").upper()
-            if severity_rank.get(sev, 0) > severity_rank.get(top_severity, 0):
-                top_severity = sev
-        elif doc.get("type") == "CWE":
-            cwe_details.append({
-                "cwe_id": doc.get("cwe_id", ""),
-                "name": doc.get("name", ""),
-                "description": doc.get("description", "")[:300],
-                "url": doc.get("url", ""),
-            })
-
-    return {
-        "cve_details": cve_details,
-        "cwe_details": cwe_details,
-        "severity": top_severity,
-    }
 
 
 def run_codebase_scan(
@@ -329,10 +277,72 @@ def run_codebase_scan(
             # Analyze each chunk
             for chunk in processed_chunks:
                 original_code = chunk["content"]
-                result = engine.analyze_snippet(original_code)
 
-                # Detection-only model: parse the structured VERDICT field.
-                # Expected output contains a line like "VERDICT: VULNERABLE" or "VERDICT: SAFE".
+                # ── Step 1: Query RAG BEFORE inference ──────────────────────────
+                # Build context from the raw code snippet so the model gets
+                # grounded CVE/CWE knowledge injected directly into its prompt.
+                rag_context_str = ""
+                rag_enrichment = {"cve_details": [], "cwe_details": [], "severity": "UNKNOWN"}
+                if rag_pipeline is not None:
+                    try:
+                        # Use a short code excerpt as the retrieval query
+                        rag_docs = rag_pipeline.query(original_code[:300], top_k=3)
+
+                        # Format a compact context block for the prompt
+                        context_lines = []
+                        for doc in rag_docs:
+                            if doc.get("type") == "CVE":
+                                cwe_str = ", ".join(doc.get("cwe_ids", [])) or "N/A"
+                                context_lines.append(
+                                    f"- {doc['cve_id']} | Severity: {doc['severity']} "
+                                    f"(CVSS {doc.get('cvss_score', '?')}) | CWE: {cwe_str} | "
+                                    f"{doc['description'][:150]}"
+                                )
+                            elif doc.get("type") == "CWE":
+                                context_lines.append(
+                                    f"- {doc['cwe_id']}: {doc.get('name', '')} — "
+                                    f"{doc.get('description', '')[:150]}"
+                                )
+                        rag_context_str = "\n".join(context_lines)
+
+                        # Also pre-build the report enrichment from the same docs
+                        # (avoids a second RAG query after inference)
+                        cve_details = []
+                        cwe_details = []
+                        top_severity = "UNKNOWN"
+                        severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "UNKNOWN": 1}
+                        for doc in rag_docs:
+                            if doc.get("type") == "CVE":
+                                cve_details.append({
+                                    "cve_id": doc.get("cve_id", ""),
+                                    "description": doc.get("description", "")[:300],
+                                    "cvss_score": doc.get("cvss_score"),
+                                    "severity": doc.get("severity", "UNKNOWN"),
+                                    "cwe_ids": doc.get("cwe_ids", []),
+                                    "published": doc.get("published", "")[:10],
+                                })
+                                sev = doc.get("severity", "UNKNOWN").upper()
+                                if severity_rank.get(sev, 0) > severity_rank.get(top_severity, 0):
+                                    top_severity = sev
+                            elif doc.get("type") == "CWE":
+                                cwe_details.append({
+                                    "cwe_id": doc.get("cwe_id", ""),
+                                    "name": doc.get("name", ""),
+                                    "description": doc.get("description", "")[:300],
+                                    "url": doc.get("url", ""),
+                                })
+                        rag_enrichment = {
+                            "cve_details": cve_details,
+                            "cwe_details": cwe_details,
+                            "severity": top_severity,
+                        }
+                    except Exception as rag_err:
+                        logger.warning(f"RAG pre-inference query failed: {rag_err}")
+
+                # ── Step 2: Run inference WITH RAG context in prompt ─────────────
+                result = engine.analyze_snippet(original_code, rag_context=rag_context_str)
+
+                # ── Step 3: Parse VERDICT from structured output ─────────────────
                 vulnerability_found = False
                 lower_res = result.lower()
 
@@ -357,9 +367,6 @@ def run_codebase_scan(
                         f"SUSPECTED VULNERABILITY flagged in {file_path.name} "
                         f"(Lines {chunk['start_line']}-{chunk['end_line']})"
                     )
-
-                    # Enrich with CVE/CWE details and severity via RAG
-                    rag_enrichment = _enrich_with_rag(rag_pipeline, result, original_code)
 
                     findings.append({
                         "file_path": str(file_path.relative_to(target_path.parent)),

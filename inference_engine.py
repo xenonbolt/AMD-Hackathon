@@ -25,8 +25,15 @@ PROMPT_TEMPLATE = (
     "  CVE_REFERENCE: <e.g. CVE-2021-12345 or UNKNOWN>\n"
     "  SEVERITY: <CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN>\n"
     "  DESCRIPTION: <one-sentence explanation>\n\n"
+    "{rag_context}"
     "### Input:\n{vuln_code}\n\n"
     "### Response:\n"
+)
+
+# Inserted between Instruction and Input when RAG results are available
+RAG_CONTEXT_PREFIX = (
+    "### Relevant CVE/CWE Context (use to inform your classification):\n"
+    "{context}\n\n"
 )
 
 
@@ -102,7 +109,7 @@ class VulnerabilityInferenceEngine:
             logger.error(f"Failed to initialize Inference Engine: {e}", exc_info=True)
             raise
 
-    def analyze_snippet(self, code: str, max_new_tokens: int = 256) -> str:
+    def analyze_snippet(self, code: str, max_new_tokens: int = 256, rag_context: str = "") -> str:
         """
         Executes detection analysis on a Java code snippet using deterministic
         (greedy) decoding.
@@ -119,13 +126,23 @@ class VulnerabilityInferenceEngine:
             code: Java source code snippet to analyze.
             max_new_tokens: Maximum number of response tokens to generate.
                             256 is sufficient for the structured label output.
+            rag_context: Optional pre-formatted RAG context string (CVE/CWE
+                         intelligence) to inject into the prompt. When provided,
+                         the model uses this grounded knowledge to fill in
+                         CVE_REFERENCE, CWE_ID, and SEVERITY rather than
+                         relying solely on its trained weights.
 
         Returns:
             Raw structured detection text from the model.
         """
         try:
-            # Construct exact prompt template matching training
-            prompt = PROMPT_TEMPLATE.format(vuln_code=code)
+            # Inject RAG context block if provided
+            rag_block = ""
+            if rag_context and rag_context.strip():
+                rag_block = RAG_CONTEXT_PREFIX.format(context=rag_context.strip())
+
+            # Construct prompt with optional RAG context
+            prompt = PROMPT_TEMPLATE.format(vuln_code=code, rag_context=rag_block)
             
             inputs = self.tokenizer(prompt, return_tensors="pt")
             input_ids = inputs["input_ids"].to(self.model.device)
