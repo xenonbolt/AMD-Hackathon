@@ -21,8 +21,6 @@ PROMPT_TEMPLATE = (
     "Return structured JSON only.\n\n"
     "<|input|>\n{vuln_code}\n\n"
     "<|response|>\n"
-    "{{\n"
-    '  "vulnerabilities": ['
 )
 
 # Inserted as a Java comment at the top of the code snippet when RAG is available
@@ -175,15 +173,14 @@ class VulnerabilityInferenceEngine:
             # Decode full sequence WITH special tokens to retain markers
             decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
 
-            # Slice off everything up to and including the forced prefix
-            JSON_PREFIX = '{\n  "vulnerabilities": ['
-            marker_idx = decoded.find(JSON_PREFIX)
+            # Slice off everything up to and including <|response|>
+            marker_idx = decoded.find(RESPONSE_MARKER)
             if marker_idx != -1:
-                raw_response = decoded[marker_idx:]
+                raw_response = decoded[marker_idx + len(RESPONSE_MARKER):]
             else:
-                # Fallback: strip the prompt text and prepend the prefix manually
+                # Fallback: strip the prompt text
                 prompt_decoded = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
-                raw_response = JSON_PREFIX + decoded[len(prompt_decoded):]
+                raw_response = decoded[len(prompt_decoded):]
 
             # Remove eos token if present
             if self.tokenizer.eos_token:

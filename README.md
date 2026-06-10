@@ -45,11 +45,8 @@ AMD/
 ├── README.md               — This file
 ├── requirements.txt        — Python dependencies
 │
-├── data_preparation.py     — PyTorch Dataset + DataCollator for QLoRA training
-│                             Parses <|instruction|>/<|input|>/<|response|> format
-│                             and masks prompts during training
-│
-├── fine_tune.py            — QLoRA 4-bit fine-tuning via PEFT + HuggingFace Trainer
+├── fine_tune.py            — QLoRA 4-bit fine-tuning using trl.SFTTrainer
+│                             (Automatically masks instruction prompt loss)
 │
 ├── inference_engine.py     — Loads base model + LoRA adapter; analyze_snippet()
 │                             injects RAG context and parses JSON model output
@@ -111,6 +108,8 @@ The model generates the corresponding JSON block directly following the `<|respo
 ```bash
 pip install -r requirements.txt
 ```
+
+*Note: The pipeline now uses `trl` for robust supervised fine-tuning.*
 
 > **Optional (recommended):** Get a free [NVD API key](https://nvd.nist.gov/developers/request-an-api-key) for higher rate limits (50 req/30s vs 5 req/30s without a key).
 

@@ -9,7 +9,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    Trainer,
     TrainingArguments
 )
 from peft import (
@@ -17,8 +16,8 @@ from peft import (
     get_peft_model,
     prepare_model_for_kbit_training
 )
-
-from data_preparation import JavaVulnerabilityDataset, CausalLMDataCollator
+from datasets import load_dataset
+from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 
 # Configure logging
 logging.basicConfig(
@@ -119,27 +118,26 @@ def run_training(
         logger.info("LoRA configuration wrapper complete. Trainable parameters:")
         model.print_trainable_parameters()
 
-        # 6. Load Datasets
-        train_dataset = JavaVulnerabilityDataset(
-            jsonl_path=dataset_path,
-            tokenizer=tokenizer,
-            max_length=1024,
-            mask_prompt=True
-        )
+        # 6. Load Datasets using huggingface datasets
+        logger.info(f"Loading dataset from {dataset_path}")
+        train_dataset = load_dataset("json", data_files={"train": dataset_path}, split="train")
         
         eval_dataset = None
         if eval_dataset_path:
-            eval_dataset = JavaVulnerabilityDataset(
-                jsonl_path=eval_dataset_path,
-                tokenizer=tokenizer,
-                max_length=1024,
-                mask_prompt=True
-            )
+            logger.info(f"Loading eval dataset from {eval_dataset_path}")
+            eval_dataset = load_dataset("json", data_files={"eval": eval_dataset_path}, split="eval")
 
-        data_collator = CausalLMDataCollator(tokenizer=tokenizer)
+        # 7. Configure Data Collator for Masked Prompt Loss
+        # This automatically finds the <|response|> token and masks everything before it (-100)
+        # ensuring the model only computes loss over the JSON vulnerabilities payload.
+        response_template = "<|response|>\n"
+        data_collator = DataCollatorForCompletionOnlyLM(
+            response_template=response_template, 
+            tokenizer=tokenizer,
+            mlm=False
+        )
 
-        # 7. Configure Training Arguments
-        # Includes Cosine Annealing, Gradient Accumulation, and FP16/BF16 flag parameters
+        # 8. Configure Training Arguments
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=epochs,
@@ -158,21 +156,25 @@ def run_training(
             report_to="none" # Prevents logging to WandB/Tensorboard automatically
         )
 
-        # 8. Instantiate Trainer
-        trainer = Trainer(
+        # 9. Instantiate SFTTrainer
+        logger.info("Initializing SFTTrainer...")
+        trainer = SFTTrainer(
             model=model,
-            args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            data_collator=data_collator
+            dataset_text_field="text",
+            max_seq_length=2048, # Increased to handle large Java files + long JSONs
+            tokenizer=tokenizer,
+            args=training_args,
+            data_collator=data_collator,
         )
 
-        # 9. Execute Training
+        # 10. Execute Training
         logger.info("Starting training loop...")
         trainer.train()
         logger.info("Training complete.")
 
-        # 10. Save Output Adapters and Tokenizer
+        # 11. Save Output Adapters and Tokenizer
         logger.info(f"Saving fine-tuned adapter weights to {output_dir}")
         trainer.model.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
