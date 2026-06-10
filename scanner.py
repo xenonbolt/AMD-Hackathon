@@ -253,26 +253,28 @@ def run_codebase_scan(
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 code_content = f.read()
 
-            # Extract methods/blocks
-            raw_blocks = extract_java_blocks(code_content)
+            # Since the model (StarCoder2) supports 16k+ context length and was trained on 
+            # full file contents (including class/package headers), we should pass the 
+            # entire file rather than destructively chunking it and breaking Java syntax.
+            num_lines = len(code_content.splitlines())
             
-            # Post-process blocks: split very large methods
-            processed_chunks: List[Dict[str, Any]] = []
-            for block in raw_blocks:
-                num_lines = block["end_line"] - block["start_line"] + 1
-                if num_lines > max_chunk_lines:
-                    # Apply sliding window chunking to avoid context blowout
-                    sub_chunks = chunk_sliding_window(
-                        block["content"], 
-                        start_line=block["start_line"], 
-                        window_size=max_chunk_lines, 
-                        overlap=20
-                    )
-                    processed_chunks.extend(sub_chunks)
-                else:
-                    processed_chunks.append(block)
-
-            logger.info(f"Extracted {len(processed_chunks)} chunks from {file_path.name}")
+            processed_chunks = []
+            if num_lines > 2000:
+                # Only use sliding window for outrageously huge files to avoid memory blowout
+                processed_chunks = chunk_sliding_window(
+                    code_content, 
+                    start_line=1, 
+                    window_size=2000, 
+                    overlap=100
+                )
+                logger.info(f"File {file_path.name} is very large ({num_lines} lines). Split into {len(processed_chunks)} chunks.")
+            else:
+                processed_chunks.append({
+                    "start_line": 1,
+                    "end_line": num_lines,
+                    "content": code_content
+                })
+                logger.info(f"Analyzing entire file: {file_path.name} ({num_lines} lines)")
 
             # Analyze each chunk
             for chunk in processed_chunks:
