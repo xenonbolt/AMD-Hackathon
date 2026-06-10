@@ -21,7 +21,7 @@ PROMPT_TEMPLATE = (
     "Return structured JSON only.\n\n"
     "<|input|>\n{vuln_code}\n\n"
     "<|response|>\n"
-    "{\n"
+    "{{\n"
     '  "vulnerabilities": ['
 )
 
