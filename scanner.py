@@ -1,416 +1,658 @@
+"""
+scanner.py
+===========
+Static analysis utility that walks a local Java codebase, extracts logical
+code blocks, passes them through the inference engine, and emits a
+structured JSON vulnerability report.
+
+Responsibilities
+----------------
+1. Recursively find all ``.java`` files under a target directory.
+2. Chunk each file into logical code blocks using a two-tier extraction
+   strategy:
+     a) **AST-inspired regex extraction** – finds individual method
+        declarations and their full bodies using brace-balanced parsing.
+     b) **Sliding-window fallback** – used for files where method extraction
+        yields nothing (e.g., interface-only files or enums).
+3. Deduplicate chunks using content hashing to avoid redundant LLM calls.
+4. Submit each unique chunk to the inference engine.
+5. Aggregate findings into a structured ``ScanReport`` and serialise to JSON.
+
+Output report schema
+--------------------
+{
+  "scan_metadata": {
+    "target_directory": "<path>",
+    "scanned_at": "<ISO-8601 timestamp>",
+    "total_files": N,
+    "total_chunks": N,
+    "total_vulnerabilities": N,
+    "engine_adapter": "<path>",
+    "base_model": "<model-id>"
+  },
+  "findings": [
+    {
+      "file_path": "<rel/path/to/File.java>",
+      "chunk_index": 0,
+      "chunk_type": "method|sliding_window",
+      "method_name": "<name or null>",
+      "line_start": N,
+      "line_end": N,
+      "vulnerabilities": [
+        {
+          "cwe_id": "CWE-89",
+          "cwe_name": "SQL Injection",
+          "severity": "critical",
+          "confidence": 0.95,
+          "location": {"start_line": N, "end_line": N, "function": "<name>"},
+          "description": "…",
+          "impact": "…",
+          "recommendation": "…"
+        }
+      ]
+    }
+  ]
+}
+
+Usage
+-----
+python scanner.py \\
+    --target ./my-java-project \\
+    --adapter ./outputs/vuln-lora \\
+    --output scan_report.json \\
+    --workers 1
+
+Author : Elite AI Engineering Team
+Python : 3.10+
+"""
+
+from __future__ import annotations
+
 import argparse
+import datetime
+import hashlib
 import json
 import logging
-import os
+import re
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Iterator
 
-from inference_engine import VulnerabilityInferenceEngine
+from inference_engine import InferenceEngine, analyze_snippet
 
-# Configure logging
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("scanner.log", mode="a", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger("scanner")
 
-# Attempt to import RAG pipeline; gracefully degrade if unavailable
-try:
-    from rag_pipeline import JavaVulnRAGPipeline
-    _RAG_AVAILABLE = True
-except ImportError:
-    _RAG_AVAILABLE = False
-    logger.warning(
-        "rag_pipeline module not found — CVE/CWE enrichment will be skipped. "
-        "Run: pip install requests"
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+_JAVA_METHOD_PATTERN: re.Pattern = re.compile(
+    r"""
+    (?:(?:public|protected|private|static|final|synchronized|abstract|native|strictfp)\s+)*
+    (?:[\w<>\[\],\s]+?)\s+                     # return type
+    (\w+)\s*\(                                  # method name + opening paren
+    [^)]*\)                                     # parameters
+    (?:\s+throws\s+[\w,\s]+)?                   # optional throws clause
+    \s*\{                                       # opening brace
+    """,
+    re.VERBOSE | re.MULTILINE,
+)
+
+# Sliding window parameters
+_WINDOW_LINES: int = 60
+_WINDOW_STRIDE: int = 30
+_MIN_CHUNK_LINES: int = 5
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CodeChunk:
+    """A single logical code block extracted from a Java file."""
+
+    content: str
+    chunk_type: str          # "method" | "sliding_window"
+    method_name: str | None  # populated for method chunks
+    line_start: int          # 1-indexed, within the source file
+    line_end: int
+    content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.content_hash = hashlib.sha256(
+            self.content.encode("utf-8")
+        ).hexdigest()
+
+
+@dataclass
+class ChunkFinding:
+    """Vulnerability findings for a single code chunk."""
+
+    file_path: str
+    chunk_index: int
+    chunk: CodeChunk
+    vulnerabilities: list[dict[str, Any]]
+
+
+@dataclass
+class ScanReport:
+    """Aggregated result of scanning an entire directory."""
+
+    target_directory: str
+    scanned_at: str
+    total_files: int
+    total_chunks: int
+    total_vulnerabilities: int
+    engine_adapter: str
+    base_model: str
+    findings: list[ChunkFinding]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scan_metadata": {
+                "target_directory": self.target_directory,
+                "scanned_at": self.scanned_at,
+                "total_files": self.total_files,
+                "total_chunks": self.total_chunks,
+                "total_vulnerabilities": self.total_vulnerabilities,
+                "engine_adapter": self.engine_adapter,
+                "base_model": self.base_model,
+            },
+            "findings": [
+                {
+                    "file_path": f.file_path,
+                    "chunk_index": f.chunk_index,
+                    "chunk_type": f.chunk.chunk_type,
+                    "method_name": f.chunk.method_name,
+                    "line_start": f.chunk.line_start,
+                    "line_end": f.chunk.line_end,
+                    "vulnerabilities": f.vulnerabilities,
+                }
+                for f in self.findings
+                if f.vulnerabilities  # Only include findings with actual vulns
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
+# File discovery
+# ---------------------------------------------------------------------------
+
+def discover_java_files(root_dir: Path) -> list[Path]:
+    """
+    Recursively collects all ``.java`` files under ``root_dir``.
+
+    Parameters
+    ----------
+    root_dir : Path
+        Root of the Java project/codebase to scan.
+
+    Returns
+    -------
+    list[Path]
+        Sorted list of discovered ``.java`` file paths.
+    """
+    if not root_dir.is_dir():
+        raise NotADirectoryError(f"Target is not a directory: {root_dir}")
+
+    java_files = sorted(root_dir.rglob("*.java"))
+    logger.info("Discovered %d .java files under %s.", len(java_files), root_dir)
+    return java_files
+
+
+# ---------------------------------------------------------------------------
+# Code chunking
+# ---------------------------------------------------------------------------
+
+def _extract_brace_balanced_body(source: str, open_brace_pos: int) -> str:
+    """
+    Extracts the complete brace-balanced block starting at ``open_brace_pos``.
+
+    Returns the extracted substring (including the surrounding braces) or an
+    empty string if the braces are unbalanced.
+    """
+    depth = 0
+    in_string: bool = False
+    in_char: bool = False
+    in_line_comment: bool = False
+    in_block_comment: bool = False
+
+    i = open_brace_pos
+    start = i
+
+    while i < len(source):
+        ch = source[i]
+
+        # Track single-line comments
+        if not in_string and not in_char and not in_block_comment:
+            if source[i : i + 2] == "//":
+                in_line_comment = True
+                i += 2
+                continue
+            if source[i : i + 2] == "/*":
+                in_block_comment = True
+                i += 2
+                continue
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if source[i : i + 2] == "*/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        # Track string literals
+        if ch == '"' and not in_char:
+            in_string = not in_string
+        elif ch == "'" and not in_string:
+            in_char = not in_char
+        elif not in_string and not in_char:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start : i + 1]
+        i += 1
+
+    return ""  # Unbalanced braces
+
+
+def extract_method_chunks(source: str) -> list[CodeChunk]:
+    """
+    Extracts individual Java method bodies from source using regex + brace
+    balancing.
+
+    Returns
+    -------
+    list[CodeChunk]
+        One ``CodeChunk`` per discovered method.
+    """
+    chunks: list[CodeChunk] = []
+    lines = source.splitlines(keepends=True)
+
+    for match in _JAVA_METHOD_PATTERN.finditer(source):
+        method_name: str = match.group(1)
+        brace_pos: int = match.end() - 1   # Position of the opening '{'
+
+        body: str = _extract_brace_balanced_body(source, brace_pos)
+        if not body:
+            continue
+
+        # Include the method signature (everything from match.start() to body end)
+        full_method_text = source[match.start() : match.start() + (brace_pos - match.start()) + len(body)]
+
+        # Determine line numbers
+        pre_source = source[: match.start()]
+        line_start = pre_source.count("\n") + 1
+        line_end = line_start + full_method_text.count("\n")
+
+        if len(full_method_text.splitlines()) < _MIN_CHUNK_LINES:
+            continue  # Skip trivial methods (constructors, getters, etc.)
+
+        chunks.append(
+            CodeChunk(
+                content=full_method_text,
+                chunk_type="method",
+                method_name=method_name,
+                line_start=line_start,
+                line_end=line_end,
+            )
+        )
+
+    return chunks
+
+
+def extract_sliding_window_chunks(source: str) -> list[CodeChunk]:
+    """
+    Fallback chunker: splits source into overlapping fixed-size windows.
+
+    Used when :func:`extract_method_chunks` returns nothing (e.g., interface
+    files, annotation-heavy classes).
+
+    Returns
+    -------
+    list[CodeChunk]
+    """
+    lines = source.splitlines()
+    chunks: list[CodeChunk] = []
+
+    start = 0
+    while start < len(lines):
+        end = min(start + _WINDOW_LINES, len(lines))
+        window_lines = lines[start:end]
+
+        if len(window_lines) < _MIN_CHUNK_LINES:
+            break
+
+        chunks.append(
+            CodeChunk(
+                content="\n".join(window_lines),
+                chunk_type="sliding_window",
+                method_name=None,
+                line_start=start + 1,
+                line_end=end,
+            )
+        )
+
+        if end == len(lines):
+            break
+        start += _WINDOW_STRIDE
+
+    return chunks
+
+
+def chunk_java_file(file_path: Path) -> tuple[str, list[CodeChunk]]:
+    """
+    Reads a ``.java`` file and returns its chunks.
+
+    Strategy: attempt method-level extraction first; fall back to sliding
+    windows if no methods are found.
+
+    Parameters
+    ----------
+    file_path : Path
+        Absolute path to the ``.java`` file.
+
+    Returns
+    -------
+    (source_code, list[CodeChunk])
+    """
+    try:
+        source = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        logger.error("Cannot read file %s: %s", file_path, exc)
+        return "", []
+
+    method_chunks = extract_method_chunks(source)
+    if method_chunks:
+        logger.debug(
+            "%s → %d method chunk(s) extracted.", file_path.name, len(method_chunks)
+        )
+        return source, method_chunks
+
+    # Fallback
+    window_chunks = extract_sliding_window_chunks(source)
+    logger.debug(
+        "%s → no methods found; using %d sliding window(s).",
+        file_path.name,
+        len(window_chunks),
+    )
+    return source, window_chunks
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def deduplicate_chunks(
+    chunks: list[CodeChunk],
+    seen_hashes: set[str],
+) -> list[CodeChunk]:
+    """
+    Filters out chunks whose content hash has already been seen globally,
+    updating ``seen_hashes`` in place.
+    """
+    unique: list[CodeChunk] = []
+    for chunk in chunks:
+        if chunk.content_hash not in seen_hashes:
+            seen_hashes.add(chunk.content_hash)
+            unique.append(chunk)
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# Scanning orchestration
+# ---------------------------------------------------------------------------
+
+def scan_directory(
+    target_dir: Path,
+    adapter_path: str | Path,
+    base_model_id: str = "bigcode/starcoder2-3b",
+    output_path: Path | None = None,
+    max_files: int | None = None,
+) -> ScanReport:
+    """
+    Full scan pipeline: discover files → chunk → infer → aggregate → save.
+
+    Parameters
+    ----------
+    target_dir : Path
+        Root of the Java codebase to scan.
+    adapter_path : str | Path
+        Path to the LoRA adapter directory.
+    base_model_id : str
+        HuggingFace model ID of the base model.
+    output_path : Path | None
+        If provided, the report is also written to this JSON file.
+    max_files : int | None
+        Optional cap on the number of files to scan (useful for testing).
+
+    Returns
+    -------
+    ScanReport
+    """
+    logger.info("=== Starting Java Security Scan ===")
+    logger.info("Target directory : %s", target_dir)
+    logger.info("Adapter path     : %s", adapter_path)
+
+    # --- Initialise inference engine (loaded once) -----------------------
+    engine = InferenceEngine.get_instance(
+        adapter_path=adapter_path,
+        base_model_id=base_model_id,
     )
 
+    # --- Discover files --------------------------------------------------
+    java_files = discover_java_files(target_dir)
+    if max_files is not None:
+        java_files = java_files[:max_files]
+        logger.info("Capped scan to %d file(s).", max_files)
 
-def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
-    """
-    Extracts logical blocks (primarily class methods) from a Java source file
-    using a character-by-character state machine to handle strings, comments, and braces.
-    """
-    chunks: List[Dict[str, Any]] = []
-    n = len(code)
-    i = 0
-    in_string = False
-    in_char = False
-    in_line_comment = False
-    in_block_comment = False
-    escape = False
-    
-    brace_level = 0
-    block_starts: Dict[int, int] = {}
-    last_separator_idx = 0
-    
-    # Pre-calculate line start offsets to map character indices to line numbers quickly
-    line_starts = [0]
-    for idx, char in enumerate(code):
-        if char == '\n':
-            line_starts.append(idx + 1)
-            
-    def get_line_num(char_idx: int) -> int:
-        # Linear scan since the number of lines is usually small
-        for line_num, start_idx in enumerate(line_starts):
-            if start_idx > char_idx:
-                return line_num
-        return len(line_starts)
+    findings: list[ChunkFinding] = []
+    seen_hashes: set[str] = set()
+    total_chunks_processed: int = 0
+    total_vulns: int = 0
 
-    try:
-        while i < n:
-            char = code[i]
-            
-            if escape:
-                escape = False
-                i += 1
-                continue
-                
-            if in_line_comment:
-                if char == '\n':
-                    in_line_comment = False
-                i += 1
-                continue
-                
-            if in_block_comment:
-                if char == '/' and i > 0 and code[i-1] == '*':
-                    in_block_comment = False
-                i += 1
-                continue
-                
-            if in_string:
-                if char == '\\':
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                i += 1
-                continue
-                
-            if in_char:
-                if char == '\\':
-                    escape = True
-                elif char == "'":
-                    in_char = False
-                i += 1
-                continue
-                
-            # Detect start of comments or strings
-            if char == '/' and i + 1 < n:
-                next_char = code[i+1]
-                if next_char == '/':
-                    in_line_comment = True
-                    i += 2
-                    continue
-                elif next_char == '*':
-                    in_block_comment = True
-                    i += 2
-                    continue
-                    
-            if char == '"':
-                in_string = True
-                i += 1
-                continue
-                
-            if char == "'":
-                in_char = True
-                i += 1
-                continue
-                
-            # Brace depth tracking
-            if char == '{':
-                brace_level += 1
-                start_idx = last_separator_idx
-                # Trim leading whitespaces and delimiters
-                while start_idx < i and code[start_idx] in ' \t\r\n;{}':
-                    start_idx += 1
-                block_starts[brace_level] = start_idx
-                last_separator_idx = i + 1
-                
-            elif char == '}':
-                if brace_level in block_starts:
-                    start_idx = block_starts[brace_level]
-                    end_idx = i + 1
-                    block_content = code[start_idx:end_idx]
-                    
-                    start_line = get_line_num(start_idx)
-                    end_line = get_line_num(end_idx)
-                    
-                    # Store block if it is method level (level 2)
-                    if brace_level == 2:
-                        chunks.append({
-                            "start_line": start_line,
-                            "end_line": end_line,
-                            "content": block_content
-                        })
-                    del block_starts[brace_level]
-                    
-                brace_level = max(0, brace_level - 1)
-                last_separator_idx = i + 1
-                
-            elif char == ';':
-                last_separator_idx = i + 1
-                
-            i += 1
+    for file_idx, java_file in enumerate(java_files, start=1):
+        rel_path = str(java_file.relative_to(target_dir))
+        logger.info("[%d/%d] Scanning: %s", file_idx, len(java_files), rel_path)
 
-    except Exception as e:
-        logger.error(f"Error during state-machine brace matching: {e}")
-        # Fallback will trigger if chunks is empty
+        _, chunks = chunk_java_file(java_file)
+        unique_chunks = deduplicate_chunks(chunks, seen_hashes)
 
-    # Fallback to returning the entire file if no methods were parsed
-    if not chunks:
-        chunks.append({
-            "start_line": 1,
-            "end_line": len(line_starts),
-            "content": code
-        })
-        
-    return chunks
+        if not unique_chunks:
+            logger.debug("  No unique chunks in %s; skipping.", rel_path)
+            continue
 
-
-def chunk_sliding_window(text: str, start_line: int, window_size: int = 60, overlap: int = 15) -> List[Dict[str, Any]]:
-    """
-    Chunks a block of code into smaller overlapping windows. 
-    Used as a fallback for large method blocks to prevent out-of-context errors.
-    """
-    lines = text.splitlines()
-    chunks = []
-    n = len(lines)
-    i = 0
-    while i < n:
-        end = min(i + window_size, n)
-        chunk_content = "\n".join(lines[i:end])
-        chunks.append({
-            "start_line": start_line + i,
-            "end_line": start_line + end - 1,
-            "content": chunk_content
-        })
-        if end == n:
-            break
-        i += (window_size - overlap)
-    return chunks
-
-
-
-
-
-def run_codebase_scan(
-    model_id: str,
-    adapter_path: str,
-    target_dir: str,
-    output_report: str,
-    max_chunk_lines: int = 100,
-    use_rag: bool = True,
-    nvd_api_key: Optional[str] = None,
-    force_rag_refresh: bool = False,
-) -> None:
-    """
-    Walks target codebase, extracts chunks, runs them through the inference engine,
-    and saves a structured JSON vulnerability report enriched with CVE/CWE
-    metadata and severity from the RAG pipeline.
-    """
-    target_path = Path(target_dir)
-    if not target_path.exists():
-        logger.error(f"Target scan directory does not exist: {target_path}")
-        return
-
-    try:
-        # Initialize inference engine once
-        logger.info(f"Loading scanner model context (Model: {model_id}, Adapter: {adapter_path})...")
-        engine = VulnerabilityInferenceEngine(
-            model_id=model_id,
-            adapter_path=adapter_path,
-            load_in_4bit=True
-        )
-    except Exception as e:
-        logger.error(f"Failed to load model context: {e}", exc_info=True)
-        return
-
-    # Initialize RAG pipeline for CVE/CWE enrichment
-    rag_pipeline = None
-    if use_rag and _RAG_AVAILABLE:
-        try:
-            logger.info("Initializing RAG pipeline for CVE/CWE enrichment …")
-            rag_pipeline = JavaVulnRAGPipeline(
-                nvd_api_key=nvd_api_key,
-                force_refresh=force_rag_refresh,
+        for chunk_idx, chunk in enumerate(unique_chunks):
+            total_chunks_processed += 1
+            logger.debug(
+                "  Chunk %d/%d (%s, lines %d-%d) → calling inference engine …",
+                chunk_idx + 1,
+                len(unique_chunks),
+                chunk.chunk_type,
+                chunk.line_start,
+                chunk.line_end,
             )
-            logger.info("RAG pipeline ready.")
-        except Exception as rag_err:
-            logger.warning(f"RAG pipeline failed to initialize: {rag_err}. Continuing without enrichment.")
-    elif use_rag and not _RAG_AVAILABLE:
-        logger.warning("RAG requested but rag_pipeline module is unavailable.")
 
-    findings: List[Dict[str, Any]] = []
-
-    # Recurse and locate all Java source files
-    logger.info(f"Scanning directory: {target_path} for .java files")
-    java_files = list(target_path.rglob("*.java"))
-    logger.info(f"Found {len(java_files)} Java files to scan.")
-
-    for file_idx, file_path in enumerate(java_files):
-        logger.info(f"[{file_idx + 1}/{len(java_files)}] Scanning: {file_path}")
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                code_content = f.read()
-
-            # Since the model (StarCoder2) supports 16k+ context length and was trained on 
-            # full file contents (including class/package headers), we should pass the 
-            # entire file rather than destructively chunking it and breaking Java syntax.
-            num_lines = len(code_content.splitlines())
-            
-            processed_chunks = []
-            if num_lines > 2000:
-                # Only use sliding window for outrageously huge files to avoid memory blowout
-                processed_chunks = chunk_sliding_window(
-                    code_content, 
-                    start_line=1, 
-                    window_size=2000, 
-                    overlap=100
+            try:
+                result: dict[str, Any] = engine.analyze_snippet(chunk.content)
+                vulns: list[dict[str, Any]] = result.get("vulnerabilities", [])
+            except Exception as exc:
+                logger.warning(
+                    "  Inference failed for chunk %d in %s: %s",
+                    chunk_idx,
+                    rel_path,
+                    exc,
                 )
-                logger.info(f"File {file_path.name} is very large ({num_lines} lines). Split into {len(processed_chunks)} chunks.")
-            else:
-                processed_chunks.append({
-                    "start_line": 1,
-                    "end_line": num_lines,
-                    "content": code_content
-                })
-                logger.info(f"Analyzing entire file: {file_path.name} ({num_lines} lines)")
+                vulns = []
 
-            # Analyze each chunk
-            for chunk in processed_chunks:
-                original_code = chunk["content"]
+            if vulns:
+                total_vulns += len(vulns)
+                logger.info(
+                    "  ⚠  %d vulnerability/-ies found in chunk %d (lines %d-%d).",
+                    len(vulns),
+                    chunk_idx,
+                    chunk.line_start,
+                    chunk.line_end,
+                )
 
-                # ── Step 1: Query RAG BEFORE inference ──────────────────────────
-                # Build context from the raw code snippet so the model gets
-                # grounded CVE/CWE knowledge injected directly into its prompt.
-                rag_context_str = ""
-                rag_enrichment = {"cve_details": [], "cwe_details": [], "severity": "UNKNOWN"}
-                if rag_pipeline is not None:
-                    try:
-                        # Use a short code excerpt as the retrieval query
-                        rag_docs = rag_pipeline.query(original_code[:300], top_k=3)
+            findings.append(
+                ChunkFinding(
+                    file_path=rel_path,
+                    chunk_index=chunk_idx,
+                    chunk=chunk,
+                    vulnerabilities=vulns,
+                )
+            )
 
-                        # Format a compact context block for the prompt
-                        context_lines = []
-                        for doc in rag_docs:
-                            if doc.get("type") == "CVE":
-                                cwe_str = ", ".join(doc.get("cwe_ids", [])) or "N/A"
-                                context_lines.append(
-                                    f"- {doc['cve_id']} | Severity: {doc['severity']} "
-                                    f"(CVSS {doc.get('cvss_score', '?')}) | CWE: {cwe_str} | "
-                                    f"{doc['description'][:150]}"
-                                )
-                            elif doc.get("type") == "CWE":
-                                context_lines.append(
-                                    f"- {doc['cwe_id']}: {doc.get('name', '')} — "
-                                    f"{doc.get('description', '')[:150]}"
-                                )
-                        rag_context_str = "\n".join(context_lines)
+    scanned_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    report = ScanReport(
+        target_directory=str(target_dir.resolve()),
+        scanned_at=scanned_at,
+        total_files=len(java_files),
+        total_chunks=total_chunks_processed,
+        total_vulnerabilities=total_vulns,
+        engine_adapter=str(adapter_path),
+        base_model=base_model_id,
+        findings=findings,
+    )
 
-                        # Also pre-build the report enrichment from the same docs
-                        # (avoids a second RAG query after inference)
-                        cve_details = []
-                        cwe_details = []
-                        top_severity = "UNKNOWN"
-                        severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "UNKNOWN": 1}
-                        for doc in rag_docs:
-                            if doc.get("type") == "CVE":
-                                cve_details.append({
-                                    "cve_id": doc.get("cve_id", ""),
-                                    "description": doc.get("description", "")[:300],
-                                    "cvss_score": doc.get("cvss_score"),
-                                    "severity": doc.get("severity", "UNKNOWN"),
-                                    "cwe_ids": doc.get("cwe_ids", []),
-                                    "published": doc.get("published", "")[:10],
-                                })
-                                sev = doc.get("severity", "UNKNOWN").upper()
-                                if severity_rank.get(sev, 0) > severity_rank.get(top_severity, 0):
-                                    top_severity = sev
-                            elif doc.get("type") == "CWE":
-                                cwe_details.append({
-                                    "cwe_id": doc.get("cwe_id", ""),
-                                    "name": doc.get("name", ""),
-                                    "description": doc.get("description", "")[:300],
-                                    "url": doc.get("url", ""),
-                                })
-                        rag_enrichment = {
-                            "cve_details": cve_details,
-                            "cwe_details": cwe_details,
-                            "severity": top_severity,
-                        }
-                    except Exception as rag_err:
-                        logger.warning(f"RAG pre-inference query failed: {rag_err}")
+    logger.info(
+        "Scan complete. Files=%d, Chunks=%d, Vulnerabilities=%d.",
+        report.total_files,
+        report.total_chunks,
+        report.total_vulnerabilities,
+    )
 
-                # ── Step 2: Run inference WITH RAG context in prompt ─────────────
-                result_dict = engine.analyze_snippet(original_code, rag_context=rag_context_str)
+    # --- Persist report --------------------------------------------------
+    if output_path is not None:
+        _save_report(report, output_path)
 
-                # ── Step 3: Handle structured JSON output ────────────────────────
-                if result_dict.get("parse_error"):
-                    logger.warning(
-                        f"Failed to parse JSON response for {file_path.name} "
-                        f"(Lines {chunk['start_line']}-{chunk['end_line']}). Raw output:\n"
-                        f"{result_dict.get('raw', '')}"
-                    )
-                    continue
+    return report
 
-                vulnerabilities = result_dict.get("vulnerabilities", [])
-                
-                # If the vulnerabilities list is not empty, vulnerabilities were found
-                if vulnerabilities:
-                    logger.warning(
-                        f"SUSPECTED VULNERABILITY flagged in {file_path.name} "
-                        f"(Lines {chunk['start_line']}-{chunk['end_line']})"
-                    )
 
-                    findings.append({
-                        "file_path": str(file_path.relative_to(target_path.parent)),
-                        "start_line": chunk["start_line"],
-                        "end_line": chunk["end_line"],
-                        "suspected_vulnerabilities": vulnerabilities,
-                        "rag_severity": rag_enrichment["severity"],
-                        "original_code": original_code,
-                        "cve_details": rag_enrichment["cve_details"],
-                        "cwe_details": rag_enrichment["cwe_details"],
-                    })
-
-        except Exception as file_err:
-            logger.error(f"Failed to scan file {file_path}: {file_err}", exc_info=True)
-
-    # Save structured output report
-    report_path = Path(output_report)
+def _save_report(report: ScanReport, output_path: Path) -> None:
+    """Serialises the scan report to a JSON file."""
     try:
-        report_data = {
-            "target_directory": str(target_path.resolve()),
-            "total_files_scanned": len(java_files),
-            "vulnerabilities_count": len(findings),
-            "findings": findings
-        }
-        with open(report_path, "w", encoding="utf-8") as rf:
-            json.dump(report_data, rf, indent=4)
-        logger.info(f"Structured JSON report successfully saved to: {report_path.resolve()}")
-    except Exception as report_err:
-        logger.error(f"Failed to write report to {report_path}: {report_err}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as fh:
+            json.dump(report.to_dict(), fh, indent=2, ensure_ascii=False)
+        logger.info("Scan report saved to: %s", output_path)
+    except OSError as exc:
+        logger.error("Failed to save scan report: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Java vulnerability scanner powered by a QLoRA fine-tuned LLM."
+    )
+    parser.add_argument(
+        "--target",
+        type=str,
+        required=True,
+        help="Root directory of the Java codebase to scan.",
+    )
+    parser.add_argument(
+        "--adapter",
+        type=str,
+        default="./outputs/vuln-lora",
+        help="Path to the saved LoRA adapter directory.",
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        default="bigcode/starcoder2-3b",
+        help="HuggingFace model ID of the base model.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="scan_report.json",
+        help="Output path for the JSON scan report.",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Maximum number of .java files to scan (useful for testing).",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Codebase Vulnerability Scanner")
-    parser.add_argument("--model_id", type=str, required=True, help="Base model identifier")
-    parser.add_argument("--adapter_path", type=str, required=True, help="Path to LoRA adapter weights")
-    parser.add_argument("--target_dir", type=str, required=True, help="Path to directory containing Java source files")
-    parser.add_argument("--output_report", type=str, default="vulnerability_report.json", help="Path for JSON output report")
-    parser.add_argument("--max_chunk_lines", type=int, default=100, help="Maximum lines of code per chunk")
-    parser.add_argument("--no_rag", action="store_true", help="Disable RAG-based CVE/CWE enrichment")
-    parser.add_argument("--nvd_api_key", type=str, default=None, help="Optional NVD API key for higher rate limits")
-    parser.add_argument("--rag_refresh", action="store_true", help="Force refresh of RAG CVE/CWE caches")
-    args = parser.parse_args()
+    args = _parse_args()
 
-    run_codebase_scan(
-        model_id=args.model_id,
-        adapter_path=args.adapter_path,
-        target_dir=args.target_dir,
-        output_report=args.output_report,
-        max_chunk_lines=args.max_chunk_lines,
-        use_rag=not args.no_rag,
-        nvd_api_key=args.nvd_api_key,
-        force_rag_refresh=args.rag_refresh,
-    )
+    # Apply user-specified log level
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    try:
+        report = scan_directory(
+            target_dir=Path(args.target),
+            adapter_path=args.adapter,
+            base_model_id=args.base_model,
+            output_path=Path(args.output),
+            max_files=args.max_files,
+        )
+
+        # Print summary table to stdout
+        print("\n" + "=" * 70)
+        print(f"{'SCAN SUMMARY':^70}")
+        print("=" * 70)
+        print(f"  Target     : {args.target}")
+        print(f"  Files      : {report.total_files}")
+        print(f"  Chunks     : {report.total_chunks}")
+        print(f"  Vulnerabilities : {report.total_vulnerabilities}")
+        print(f"  Report     : {args.output}")
+        print("=" * 70)
+
+        if report.total_vulnerabilities > 0:
+            vuln_findings = [f for f in report.findings if f.vulnerabilities]
+            print(f"\n  Top findings ({min(5, len(vuln_findings))} of {len(vuln_findings)}):")
+            for finding in vuln_findings[:5]:
+                for vuln in finding.vulnerabilities:
+                    cwe = vuln.get("cwe_id", "N/A")
+                    sev = vuln.get("severity", "N/A")
+                    func = vuln.get("location", {}).get("function", "unknown")
+                    print(
+                        f"    [{sev.upper():8s}] {cwe} in {finding.file_path}::{func}"
+                    )
+        print()
+
+    except KeyboardInterrupt:
+        logger.info("Scan interrupted by user.")
+        sys.exit(0)
+    except Exception as exc:
+        logger.exception("Scanner failed: %s", exc)
+        sys.exit(1)
