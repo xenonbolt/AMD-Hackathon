@@ -126,15 +126,16 @@ class FinetuneConfig:
     fp16: bool = False
     bf16: bool = True
     logging_steps: int = 10
-    # NOTE: save_strategy and eval_strategy are "steps" by default here
-    # because "epoch"-level saving with load_best_model_at_end=True can
-    # conflict with PEFT adapter-only saves. We save the final adapter
-    # explicitly after training instead.
+    # save_strategy/eval_strategy are "steps" to avoid PEFT checkpoint-reload
+    # conflicts with load_best_model_at_end=True.
+    # save_steps/eval_steps are computed dynamically in run_training() so they
+    # are always reachable regardless of dataset size. The sentinel value of -1
+    # means "compute automatically" (see run_training).
     save_strategy: str = "steps"
-    save_steps: int = 200
+    save_steps: int = -1          # -1 → auto-computed to ~25% of total steps
     eval_strategy: str = "steps"
-    eval_steps: int = 200
-    save_total_limit: int = 2
+    eval_steps: int = -1          # -1 → auto-computed to ~25% of total steps
+    save_total_limit: int = 3
     # Disabled: avoids Trainer trying to reload a PEFT checkpoint
     load_best_model_at_end: bool = False
     gradient_checkpointing: bool = True
@@ -297,20 +298,21 @@ def apply_lora(
 # Training arguments
 # ---------------------------------------------------------------------------
 
-def build_training_arguments(cfg: FinetuneConfig) -> TrainingArguments:
+def build_training_arguments(cfg: FinetuneConfig, save_steps: int) -> TrainingArguments:
     """
     Constructs ``TrainingArguments``.
 
-    Key decisions:
+    Key decisions
+    -------------
     - ``save_strategy="steps"`` + ``load_best_model_at_end=False`` avoids
-      the Trainer trying to load a full HF checkpoint on top of a PEFT model,
-      which causes a crash. The final adapter is saved explicitly.
-    - ``optim="paged_adamw_8bit"`` uses bitsandbytes' memory-efficient AdamW.
-    - ``remove_unused_columns=False`` is required because our dataset has
-      pre-built ``input_ids``/``attention_mask``/``labels`` columns.
+      the Trainer trying to load a full HF checkpoint on top of a PEFT model.
+    - ``save_steps`` is passed in from ``run_training()`` after being computed
+      dynamically so it is always ≤ total training steps.
+    - ``optim="paged_adamw_8bit"`` uses bitsandbytes memory-efficient AdamW.
+    - ``remove_unused_columns=False`` keeps our pre-built token columns.
     """
-    # Resolve the output directory and create it eagerly so that the
-    # logging_dir sub-path never raises a FileNotFoundError.
+    # Create the output directory and its logs sub-dir eagerly so that
+    # TrainingArguments never raises FileNotFoundError on logging_dir.
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "logs").mkdir(parents=True, exist_ok=True)
@@ -331,9 +333,9 @@ def build_training_arguments(cfg: FinetuneConfig) -> TrainingArguments:
         logging_dir=str(out / "logs"),
         logging_steps=cfg.logging_steps,
         save_strategy=cfg.save_strategy,
-        save_steps=cfg.save_steps,
+        save_steps=save_steps,
         eval_strategy=cfg.eval_strategy,
-        eval_steps=cfg.eval_steps,
+        eval_steps=save_steps,          # keep eval cadence in sync with saves
         save_total_limit=cfg.save_total_limit,
         load_best_model_at_end=cfg.load_best_model_at_end,
         gradient_checkpointing=cfg.gradient_checkpointing,
@@ -386,21 +388,35 @@ def run_training(cfg: FinetuneConfig) -> None:
     base_model = load_base_model(cfg.base_model, bnb_config, cfg.trust_remote_code)
     lora_model = apply_lora(base_model, LoRAHyperParams())
 
-    # --- Training arguments ----------------------------------------------
-    training_args = build_training_arguments(cfg)
-
-    # Cosine annealing T_max = number of optimiser update steps
-    total_steps: int = math.ceil(
-        len(dataset_dict["train"])
-        / (cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps)
-        * cfg.num_epochs
+    # --- Compute save_steps dynamically ----------------------------------
+    # With a small dataset (e.g. 633 samples, batch 2, grad_accum 8) total
+    # optimizer steps ≈ 120 over 3 epochs. A hard-coded save_steps=200 would
+    # be unreachable → zero checkpoints written. We target ~4 checkpoints per
+    # training run, floored at 1 so the value is always valid.
+    total_steps: int = max(
+        1,
+        math.ceil(
+            len(dataset_dict["train"])
+            / (cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps)
+        ) * cfg.num_epochs,
     )
+    if cfg.save_steps == -1:
+        save_steps = max(1, total_steps // 4)
+    else:
+        save_steps = min(cfg.save_steps, total_steps)  # clamp so it's reachable
+
+    logger.info(
+        "Total optimizer steps ≈ %d  |  checkpoint every %d steps",
+        total_steps,
+        save_steps,
+    )
+
+    # --- Training arguments ----------------------------------------------
+    training_args = build_training_arguments(cfg, save_steps=save_steps)
+
     cosine_cb = CosineAnnealingCallback(t_max=total_steps)
 
     # --- Data collator ---------------------------------------------------
-    # The dataset is already padded to max_seq_length in data_preparation.py,
-    # so pad_to_multiple_of=8 just enforces alignment; no re-padding occurs
-    # for sequences that are already at max length.
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokeniser,
         model=lora_model,
@@ -428,17 +444,69 @@ def run_training(cfg: FinetuneConfig) -> None:
         raise
 
     # --- Save adapter weights + tokeniser --------------------------------
-    # We call save_pretrained() explicitly rather than relying on the Trainer
-    # so that only the LoRA adapter (not the full base model) is persisted.
+    # PRIMARY: trainer.save_model() is the PEFT-aware path used by the Trainer
+    # internally. It calls model.save_pretrained() through the proper interface
+    # and is guaranteed to write adapter_config.json + adapter_model weights.
     adapter_save_path = Path(cfg.output_dir)
-    logger.info("Saving LoRA adapter to: %s", adapter_save_path)
+    logger.info("Saving adapter via trainer.save_model() → %s", adapter_save_path)
     try:
-        lora_model.save_pretrained(str(adapter_save_path))
-        tokeniser.save_pretrained(str(adapter_save_path))
-        logger.info("Adapter weights and tokeniser saved successfully.")
+        trainer.save_model(str(adapter_save_path))
+        logger.info("trainer.save_model() succeeded.")
     except Exception as exc:
-        logger.exception("save_pretrained() failed: %s", exc)
+        logger.warning("trainer.save_model() raised %s — falling back to save_pretrained().", exc)
+        # FALLBACK: call save_pretrained() directly on the PEFT model
+        try:
+            lora_model.save_pretrained(str(adapter_save_path))
+            logger.info("Fallback lora_model.save_pretrained() succeeded.")
+        except Exception as exc2:
+            logger.exception("Both save paths failed. Last error: %s", exc2)
+            raise exc2
+
+    # Tokeniser is always saved separately (Trainer.save_model skips it)
+    try:
+        tokeniser.save_pretrained(str(adapter_save_path))
+        logger.info("Tokeniser saved to: %s", adapter_save_path)
+    except Exception as exc:
+        logger.exception("Tokeniser save failed: %s", exc)
         raise
+
+    # --- Verify critical files exist on disk -----------------------------
+    required_files = ["adapter_config.json"]
+    optional_files = ["adapter_model.safetensors", "adapter_model.bin"]
+    missing: list[str] = []
+
+    for fname in required_files:
+        fpath = adapter_save_path / fname
+        if fpath.exists():
+            logger.info("  ✓ %s  (%d bytes)", fname, fpath.stat().st_size)
+        else:
+            missing.append(fname)
+            logger.error("  ✗ MISSING: %s", fname)
+
+    adapter_weights_found = any(
+        (adapter_save_path / f).exists() for f in optional_files
+    )
+    if adapter_weights_found:
+        for f in optional_files:
+            fp = adapter_save_path / f
+            if fp.exists():
+                logger.info("  ✓ %s  (%d bytes)", f, fp.stat().st_size)
+    else:
+        missing.append("adapter_model.safetensors / adapter_model.bin")
+        logger.error("  ✗ MISSING: adapter weight file (no .safetensors or .bin found)")
+
+    if missing:
+        raise RuntimeError(
+            f"Save appeared to succeed but these files are absent in "
+            f"{adapter_save_path}: {missing}. "
+            f"Check disk space and directory permissions."
+        )
+
+    # Log full directory listing for visibility
+    saved_files = sorted(adapter_save_path.iterdir())
+    logger.info("Contents of %s:", adapter_save_path)
+    for p in saved_files:
+        logger.info("  %s  (%d bytes)", p.name, p.stat().st_size if p.is_file() else 0)
 
     # --- Save training metrics -------------------------------------------
     metrics_path = adapter_save_path / "train_metrics.json"
@@ -476,10 +544,11 @@ def _parse_args() -> FinetuneConfig:
                         help="Gradient accumulation steps (effective batch = batch-size × grad-accum)")
     parser.add_argument("--val-split", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save-steps", type=int, default=200,
-                        help="Save a Trainer checkpoint every N steps")
-    parser.add_argument("--eval-steps", type=int, default=200,
-                        help="Run evaluation every N steps")
+    parser.add_argument("--save-steps", type=int, default=-1,
+                        help="Save a Trainer checkpoint every N steps. "
+                             "Default -1 = auto (25%% of total steps, always reachable).")
+    parser.add_argument("--eval-steps", type=int, default=-1,
+                        help="Run evaluation every N steps (synced with save-steps by default).")
     parser.add_argument("--no-bf16", action="store_true",
                         help="Disable BF16; use FP16 instead (for non-Ampere GPUs)")
     args = parser.parse_args()
