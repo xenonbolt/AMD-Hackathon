@@ -1,13 +1,14 @@
 import argparse
+import json
 import logging
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Any, Optional, Union
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 
-# Configure logging
+# Configure structured logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -15,17 +16,16 @@ logging.basicConfig(
 logger = logging.getLogger("inference_engine")
 
 PROMPT_TEMPLATE = (
-    "### Instruction: Analyze the following Java code for vulnerabilities. "
-    "If a vulnerability exists, identify it and provide the remediated code.\n\n"
-    "### Input:\n{vuln_code}\n\n"
-    "### Response:\n"
+    "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. Return structured JSON only.\n\n"
+    "<|input|>\n{raw_code}\n\n"
+    "<|response|>\n"
 )
 
 
 class VulnerabilityInferenceEngine:
     """
-    Manages loading a base model along with trained LoRA adapter parameters, 
-    and handles deterministic analysis of Java code snippets.
+    Manages loading a base model in 4-bit precision, overlays a PEFT adapter,
+    and handles deterministic vulnerability analysis of Java files.
     """
     def __init__(
         self,
@@ -34,133 +34,180 @@ class VulnerabilityInferenceEngine:
         load_in_4bit: bool = True
     ) -> None:
         """
-        Initializes the inference engine.
+        Initializes the inference engine by loading the model and tokenizer.
 
         Args:
-            model_id: HuggingFace hub id or path to local base model.
-            adapter_path: Path to directory containing LoRA adapter weights (optional).
-            load_in_4bit: If True, loads the base model in 4-bit precision to reduce VRAM footprint.
+            model_id: HuggingFace model hub ID or local path to base model.
+            adapter_path: Local path to trained PEFT adapter checkpoints (optional).
+            load_in_4bit: Whether to load the base model in 4-bit precision (requires CUDA).
         """
         self.model_id = model_id
         self.adapter_path = adapter_path
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
+
         try:
             logger.info(f"Loading tokenizer for model: {model_id}")
             self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
             if self.tokenizer.pad_token_id is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-            # Load quantized or float16 model based on configuration
-            compute_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-            
+                if self.tokenizer.pad_token_id is None:
+                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+            # Determine quantization and device map
+            bnb_config = None
+            device_map = None
+
             if load_in_4bit and torch.cuda.is_available():
-                logger.info("Configuring 4-bit quantization config for inference...")
+                compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                logger.info(f"Configuring 4-bit BitsAndBytes quantization. Compute dtype: {compute_dtype}")
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_compute_dtype=compute_dtype
                 )
-                logger.info(f"Loading base model in 4-bit quantization: {model_id}")
-                base_model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    quantization_config=bnb_config,
-                    device_map="auto",
-                    trust_remote_code=True
-                )
+                device_map = "auto"
             else:
-                logger.info(f"Loading base model in FP16/BF16: {model_id}")
-                base_model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    torch_dtype=compute_dtype,
-                    device_map="auto" if torch.cuda.is_available() else None,
-                    trust_remote_code=True
-                )
-                if not torch.cuda.is_available():
-                    base_model = base_model.to("cpu")
+                logger.warning("BitsAndBytes 4-bit is disabled or CUDA is unavailable. Loading base model in full precision.")
 
-            # Load LoRA adapter if specified
+            logger.info(f"Loading base model: {model_id}")
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                trust_remote_code=True
+            )
+
+            # Apply PEFT adapter if provided
             if self.adapter_path:
-                logger.info(f"Applying LoRA adapter checkpoints from: {adapter_path}")
-                self.model = PeftModel.from_pretrained(base_model, adapter_path)
+                logger.info(f"Overlaying PEFT adapter from path: {self.adapter_path}")
+                self.model = PeftModel.from_pretrained(base_model, str(self.adapter_path))
             else:
-                logger.info("No LoRA adapter specified. Running inference with base model.")
+                logger.warning("No PEFT adapter specified. Running raw base model.")
                 self.model = base_model
-                
+
             self.model.eval()
-            logger.info("Model loading and state initialization complete.")
-        except Exception as e:
-            logger.error(f"Failed to initialize Inference Engine: {e}", exc_info=True)
+            logger.info("Inference engine model configuration and setup completed successfully.")
+
+        except Exception as err:
+            logger.error(f"Failed to initialize VulnerabilityInferenceEngine: {err}", exc_info=True)
             raise
 
-    def analyze_snippet(self, code: str, max_new_tokens: int = 512) -> str:
+    def analyze_file_content(self, raw_code: str, max_new_tokens: int = 1024) -> Dict[str, Any]:
         """
-        Executes analysis on a Java code snippet using deterministic (greedy) decoding.
+        Wraps raw Java code into the specialized token prompt layout, generates
+        a vulnerability report using deterministic greedy search, and parses JSON output.
 
         Args:
-            code: Java source code snippet to analyze.
-            max_new_tokens: Maximum number of response tokens to generate.
+            raw_code: The raw Java source code content string.
+            max_new_tokens: Maximum tokens allowed to be generated by the model.
 
         Returns:
-            Extracted remediation text / output from the model.
+            A parsed JSON dictionary of vulnerabilities or an error dictionary.
         """
         try:
-            # Construct exact prompt template matching training
-            prompt = PROMPT_TEMPLATE.format(vuln_code=code)
+            # 1. Wrap raw code in Prompt structure
+            prompt = PROMPT_TEMPLATE.format(raw_code=raw_code)
             
+            # Tokenize input prompt
             inputs = self.tokenizer(prompt, return_tensors="pt")
             input_ids = inputs["input_ids"].to(self.model.device)
             attention_mask = inputs["attention_mask"].to(self.model.device)
 
+            # 2. Run deterministic generation (do_sample=False)
             with torch.no_grad():
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
-                    do_sample=False,  # Deterministic (greedy) decoding
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
+                    do_sample=False,  # Greedy decoding for determinism
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id
                 )
 
-            # Decode complete sequence
+            # Decode output sequence
             decoded_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Isolate the response segment from prompt text
-            # In cases where model generated EOS or standard formatting, slice after response header
-            response_marker = "### Response:\n"
+
+            # 3. Use an end-of-sequence stopper to cut off generation cleanly
+            # We slice the text generated *after* the response marker to isolate the JSON block
+            response_marker = "<|response|>\n"
             marker_idx = decoded_output.find(response_marker)
             if marker_idx != -1:
-                response = decoded_output[marker_idx + len(response_marker):].strip()
+                generated_response = decoded_output[marker_idx + len(response_marker):].strip()
             else:
-                # Fallback: slice using length of constructed prompt if marker not found cleanly
-                # (Skipping special characters or potential formatting variations)
+                # Fallback if marker is missing: slice by prompt length
                 clean_prompt = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                response = decoded_output[len(clean_prompt):].strip()
-                
-            return response
-            
-        except Exception as e:
-            logger.error(f"Error during analysis of code snippet: {e}", exc_info=True)
-            return f"Error: Analysis execution failed. Details: {str(e)}"
+                generated_response = decoded_output[len(clean_prompt):].strip()
+
+            # Ensure we stop if the tokenizer EOS token is in string representation
+            eos_token_str = self.tokenizer.eos_token
+            if eos_token_str and eos_token_str in generated_response:
+                generated_response = generated_response.split(eos_token_str)[0].strip()
+
+            # 4. Safely parse response using the native json library
+            return self._parse_json_safely(generated_response)
+
+        except Exception as err:
+            logger.error(f"Inference execution failed on code block: {err}", exc_info=True)
+            return {
+                "vulnerabilities": [],
+                "error": f"Inference execution failed: {str(err)}"
+            }
+
+    def _parse_json_safely(self, text: str) -> Dict[str, Any]:
+        """
+        Cleans markdown wrappers and parses JSON blocks from raw text responses.
+        """
+        cleaned_text = text.strip()
+
+        # Remove markdown code blocks if the model wrapped the JSON output
+        if cleaned_text.startswith("```"):
+            # Skip past '```json' or '```'
+            first_newline = cleaned_text.find("\n")
+            if first_newline != -1:
+                cleaned_text = cleaned_text[first_newline:].strip()
+            if cleaned_text.endswith("```"):
+                cleaned_text = cleaned_text[:-3].strip()
+
+        # Find first curly brace and last curly brace to isolate the JSON object
+        start_brace = cleaned_text.find("{")
+        end_brace = cleaned_text.rfind("}")
+
+        if start_brace != -1 and end_brace != -1 and end_brace > start_brace:
+            json_candidate = cleaned_text[start_brace:end_brace + 1]
+        else:
+            json_candidate = cleaned_text
+
+        try:
+            parsed_data: Dict[str, Any] = json.loads(json_candidate)
+            # Standardize returned output layout
+            if "vulnerabilities" not in parsed_data:
+                parsed_data = {"vulnerabilities": [], "raw_output": parsed_data}
+            return parsed_data
+        except json.JSONDecodeError as decode_err:
+            logger.error(f"Failed to decode response as JSON. Raw output: {text}. Error: {decode_err}")
+            return {
+                "vulnerabilities": [],
+                "error": f"Invalid JSON format: {str(decode_err)}",
+                "raw_response": text
+            }
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test and Run Inference Engine")
+    parser = argparse.ArgumentParser(description="Inference Engine Verification")
     parser.add_argument("--model_id", type=str, required=True, help="Base model identifier")
-    parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter weights (optional)")
-    parser.add_argument("--snippet_path", type=str, required=True, help="Path to Java code snippet file to analyze")
-    parser.add_argument("--no_quant", action="store_true", help="Disable 4-bit quantization loading for base model")
+    parser.add_argument("--adapter_path", type=str, default=None, help="PEFT adapter weights directory")
+    parser.add_argument("--snippet_path", type=str, required=True, help="Path to Java file snippet to scan")
+    parser.add_argument("--no_quant", action="store_true", help="Disable 4-bit quantization")
     args = parser.parse_args()
 
     snippet_file = Path(args.snippet_path)
     if not snippet_file.exists():
-        logger.error(f"Specified code snippet path does not exist: {snippet_file}")
+        logger.error(f"Target snippet file not found: {snippet_file}")
         exit(1)
 
     try:
-        logger.info(f"Reading snippet file: {snippet_file}")
-        with open(snippet_file, "r", encoding="utf-8") as f:
+        with open(snippet_file, "r", encoding="utf-8", errors="ignore") as f:
             code_content = f.read()
 
         engine = VulnerabilityInferenceEngine(
@@ -169,14 +216,14 @@ if __name__ == "__main__":
             load_in_4bit=not args.no_quant
         )
 
-        logger.info("Running deterministic snippet analysis...")
-        result = engine.analyze_snippet(code_content)
+        logger.info("Executing deterministic analysis on file contents...")
+        report = engine.analyze_file_content(code_content)
 
         print("\n" + "=" * 50)
-        print("INFERENCE RUN REPORT:")
+        print("INFERENCE VULNERABILITY REPORT:")
         print("=" * 50)
-        print(result)
+        print(json.dumps(report, indent=4))
         print("=" * 50 + "\n")
 
-    except Exception as err:
-        logger.error(f"Inference run failed: {err}")
+    except Exception as e:
+        logger.error(f"Verification run failed: {e}", exc_info=True)

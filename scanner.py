@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Tuple
 
 from inference_engine import VulnerabilityInferenceEngine
 
-# Configure logging
+# Configure structured logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -19,6 +19,7 @@ def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
     """
     Extracts logical blocks (primarily class methods) from a Java source file
     using a character-by-character state machine to handle strings, comments, and braces.
+    Preserved for backward compatibility and granular code segmenting.
     """
     chunks: List[Dict[str, Any]] = []
     n = len(code)
@@ -33,14 +34,13 @@ def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
     block_starts: Dict[int, int] = {}
     last_separator_idx = 0
     
-    # Pre-calculate line start offsets to map character indices to line numbers quickly
+    # Pre-calculate line start offsets
     line_starts = [0]
     for idx, char in enumerate(code):
         if char == '\n':
             line_starts.append(idx + 1)
             
     def get_line_num(char_idx: int) -> int:
-        # Linear scan since the number of lines is usually small
         for line_num, start_idx in enumerate(line_starts):
             if start_idx > char_idx:
                 return line_num
@@ -109,7 +109,6 @@ def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
             if char == '{':
                 brace_level += 1
                 start_idx = last_separator_idx
-                # Trim leading whitespaces and delimiters
                 while start_idx < i and code[start_idx] in ' \t\r\n;{}':
                     start_idx += 1
                 block_starts[brace_level] = start_idx
@@ -124,7 +123,6 @@ def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
                     start_line = get_line_num(start_idx)
                     end_line = get_line_num(end_idx)
                     
-                    # Store block if it is method level (level 2)
                     if brace_level == 2:
                         chunks.append({
                             "start_line": start_line,
@@ -143,7 +141,6 @@ def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
 
     except Exception as e:
         logger.error(f"Error during state-machine brace matching: {e}")
-        # Fallback will trigger if chunks is empty
 
     # Fallback to returning the entire file if no methods were parsed
     if not chunks:
@@ -156,155 +153,133 @@ def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
     return chunks
 
 
-def chunk_sliding_window(text: str, start_line: int, window_size: int = 60, overlap: int = 15) -> List[Dict[str, Any]]:
-    """
-    Chunks a block of code into smaller overlapping windows. 
-    Used as a fallback for large method blocks to prevent out-of-context errors.
-    """
-    lines = text.splitlines()
-    chunks = []
-    n = len(lines)
-    i = 0
-    while i < n:
-        end = min(i + window_size, n)
-        chunk_content = "\n".join(lines[i:end])
-        chunks.append({
-            "start_line": start_line + i,
-            "end_line": start_line + end - 1,
-            "content": chunk_content
-        })
-        if end == n:
-            break
-        i += (window_size - overlap)
-    return chunks
-
-
 def run_codebase_scan(
     model_id: str,
     adapter_path: str,
     target_dir: str,
-    output_report: str,
-    max_chunk_lines: int = 100
+    output_report: str = "security_report.json",
+    use_chunks: bool = False
 ) -> None:
     """
-    Walks target codebase, extracts chunks, runs them through the inference engine, 
-    and saves a structured JSON vulnerability report.
+    Recursively scans a target directory for Java source files, reads and analyzes their
+    codeblocks with the inference engine, and outputs compiled results to a JSON report.
     """
     target_path = Path(target_dir)
     if not target_path.exists():
-        logger.error(f"Target scan directory does not exist: {target_path}")
+        logger.error(f"Target directory for scanning does not exist: {target_path}")
         return
 
+    # Initialize the inference engine wrapper
     try:
-        # Initialize inference engine once
-        logger.info(f"Loading scanner model context (Model: {model_id}, Adapter: {adapter_path})...")
+        logger.info(f"Initializing inference context (Base: {model_id}, Adapter: {adapter_path})...")
         engine = VulnerabilityInferenceEngine(
             model_id=model_id,
             adapter_path=adapter_path,
             load_in_4bit=True
         )
-    except Exception as e:
-        logger.error(f"Failed to load model context: {e}", exc_info=True)
+    except Exception as err:
+        logger.error(f"Failed to load model framework context: {err}", exc_info=True)
         return
 
-    findings: List[Dict[str, Any]] = []
-
-    # Recurse and locate all Java source files
-    logger.info(f"Scanning directory: {target_path} for .java files")
+    # Scan directories recursively
+    logger.info(f"Recursively exploring path: {target_path} for '.java' source files.")
     java_files = list(target_path.rglob("*.java"))
-    logger.info(f"Found {len(java_files)} Java files to scan.")
+    logger.info(f"Discovered {len(java_files)} Java source files to scan.")
 
-    for file_idx, file_path in enumerate(java_files):
-        logger.info(f"[{file_idx + 1}/{len(java_files)}] Scanning: {file_path}")
+    compiled_findings: List[Dict[str, Any]] = []
+    failed_scans: List[Dict[str, Any]] = []
+
+    for idx, file_path in enumerate(java_files, 1):
+        relative_path = str(file_path.relative_to(target_path))
+        logger.info(f"[{idx}/{len(java_files)}] Scanning file: {relative_path}")
+
         try:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                code_content = f.read()
+                file_content = f.read()
 
-            # Extract methods/blocks
-            raw_blocks = extract_java_blocks(code_content)
-            
-            # Post-process blocks: split very large methods
-            processed_chunks: List[Dict[str, Any]] = []
-            for block in raw_blocks:
-                num_lines = block["end_line"] - block["start_line"] + 1
-                if num_lines > max_chunk_lines:
-                    # Apply sliding window chunking to avoid context blowout
-                    sub_chunks = chunk_sliding_window(
-                        block["content"], 
-                        start_line=block["start_line"], 
-                        window_size=max_chunk_lines, 
-                        overlap=20
-                    )
-                    processed_chunks.extend(sub_chunks)
-                else:
-                    processed_chunks.append(block)
+            # Choose block size strategy
+            if use_chunks:
+                logger.info(f"Using method-level segmentation for: {file_path.name}")
+                chunks = extract_java_blocks(file_content)
+            else:
+                logger.info(f"Using full-text block execution for: {file_path.name}")
+                chunks = [{
+                    "start_line": 1,
+                    "end_line": len(file_content.splitlines()),
+                    "content": file_content
+                }]
 
-            logger.info(f"Extracted {len(processed_chunks)} chunks from {file_path.name}")
-
-            # Analyze each chunk
-            for chunk in processed_chunks:
-                original_code = chunk["content"]
-                result = engine.analyze_snippet(original_code)
+            for chunk in chunks:
+                raw_code = chunk["content"]
                 
-                # Deduce if a vulnerability is flagged
-                # Clean whitespace/formatting to avoid false positives in change detection
-                clean_orig = "".join(original_code.split())
-                clean_res = "".join(result.split())
-                
-                # If remediation code differs or mentions vulnerability terms
-                vulnerability_found = False
-                vulnerability_keywords = ["vuln", "vulnerability", "remediation", "exploit", "unsafe", "security"]
-                
-                if clean_orig != clean_res:
-                    # Verify it's not a generic response saying "no vulnerability"
-                    lower_res = result.lower()
-                    if not any(phrase in lower_res for phrase in ["no vulnerability", "secure", "safe code", "no issues"]):
-                        vulnerability_found = True
-                else:
-                    # Check if output contains explicit vulnerability explanations without rewriting
-                    if any(kw in result.lower() for kw in vulnerability_keywords) and "no vulnerability" not in result.lower():
-                        vulnerability_found = True
+                # Execute inference and exception-safe JSON parsing
+                result = engine.analyze_file_content(raw_code)
 
-                if vulnerability_found:
+                # Check if parsing or inference failed
+                if "error" in result:
                     logger.warning(
-                        f"SUSPECTED VULNERABILITY flagged in {file_path.name} "
-                        f"(Lines {chunk['start_line']}-{chunk['end_line']})"
+                        f"Scan anomaly detected in {relative_path} (Lines {chunk['start_line']}-{chunk['end_line']}): {result['error']}"
                     )
-                    findings.append({
-                        "file_path": str(file_path.relative_to(target_path.parent)),
+                    failed_scans.append({
+                        "file_path": relative_path,
                         "start_line": chunk["start_line"],
                         "end_line": chunk["end_line"],
-                        "suspected_vulnerability": "Flagged by model inference",
-                        "original_code": original_code,
-                        "suggested_remediation": result
+                        "error_message": result["error"],
+                        "raw_response": result.get("raw_response", "")
                     })
+                    continue
+
+                # Compile valid vulnerability detections
+                vulnerabilities = result.get("vulnerabilities", [])
+                if isinstance(vulnerabilities, list):
+                    for vuln in vulnerabilities:
+                        # Map each vulnerability to its file and segment metadata
+                        compiled_findings.append({
+                            "file_path": relative_path,
+                            "chunk_start_line": chunk["start_line"],
+                            "chunk_end_line": chunk["end_line"],
+                            "cwe_id": vuln.get("cwe_id", "Unknown"),
+                            "cwe_name": vuln.get("cwe_name", "Unknown"),
+                            "severity": vuln.get("severity", "medium"),
+                            "confidence": vuln.get("confidence", 1.0),
+                            "location": vuln.get("location", {}),
+                            "description": vuln.get("description", ""),
+                            "impact": vuln.get("impact", ""),
+                            "recommendation": vuln.get("recommendation", "")
+                        })
 
         except Exception as file_err:
-            logger.error(f"Failed to scan file {file_path}: {file_err}", exc_info=True)
+            logger.error(f"Failed to read/process file {relative_path}: {file_err}", exc_info=True)
+            failed_scans.append({
+                "file_path": relative_path,
+                "error_message": f"File read or execution exception: {str(file_err)}"
+            })
 
-    # Save structured output report
+    # Save results to master vulnerability report
+    report_data = {
+        "target_directory": str(target_path.resolve()),
+        "total_files_scanned": len(java_files),
+        "vulnerabilities_detected": len(compiled_findings),
+        "vulnerabilities": compiled_findings,
+        "failed_scans": failed_scans
+    }
+
     report_path = Path(output_report)
     try:
-        report_data = {
-            "target_directory": str(target_path.resolve()),
-            "total_files_scanned": len(java_files),
-            "vulnerabilities_count": len(findings),
-            "findings": findings
-        }
         with open(report_path, "w", encoding="utf-8") as rf:
             json.dump(report_data, rf, indent=4)
-        logger.info(f"Structured JSON report successfully saved to: {report_path.resolve()}")
+        logger.info(f"Master vulnerability scan report compiled and saved to: {report_path.resolve()}")
     except Exception as report_err:
-        logger.error(f"Failed to write report to {report_path}: {report_err}")
+        logger.error(f"Failed to write master report file to {report_path}: {report_err}", exc_info=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Codebase Vulnerability Scanner")
     parser.add_argument("--model_id", type=str, required=True, help="Base model identifier")
-    parser.add_argument("--adapter_path", type=str, required=True, help="Path to LoRA adapter weights")
+    parser.add_argument("--adapter_path", type=str, required=True, help="Path to LoRA adapter checkpoints")
     parser.add_argument("--target_dir", type=str, required=True, help="Path to directory containing Java source files")
-    parser.add_argument("--output_report", type=str, default="vulnerability_report.json", help="Path for JSON output report")
-    parser.add_argument("--max_chunk_lines", type=int, default=100, help="Maximum lines of code per chunk")
+    parser.add_argument("--output_report", type=str, default="security_report.json", help="Path for JSON output report")
+    parser.add_argument("--use_chunks", action="store_true", help="Enable method-level code segmentation")
     args = parser.parse_args()
 
     run_codebase_scan(
@@ -312,5 +287,5 @@ if __name__ == "__main__":
         adapter_path=args.adapter_path,
         target_dir=args.target_dir,
         output_report=args.output_report,
-        max_chunk_lines=args.max_chunk_lines
+        use_chunks=args.use_chunks
     )

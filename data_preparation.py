@@ -1,79 +1,79 @@
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Union, Any, Optional
+from typing import Dict, List, Union, Optional, Any
 
 import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
-# Setup structured logging
+# Configure structured logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("data_preparation")
 
-# Standard prompt templates
-PROMPT_INSTRUCTION = (
-    "### Instruction: Analyze the following Java code for vulnerabilities. "
-    "If a vulnerability exists, identify it and provide the remediated code.\n\n"
-)
-INPUT_TEMPLATE = "### Input:\n{vuln_code}\n\n"
-RESPONSE_TEMPLATE = "### Response:\n{fixed_code}"
-
 
 class JavaVulnerabilityDataset(Dataset):
     """
-    A custom PyTorch Dataset that loads Java vulnerability data from a JSONL file,
-    formats them into instruction-following prompts, and tokenizes them for
-    causal language model training (with prompt label masking).
+    A custom PyTorch Dataset designed to process a local JSONL file containing
+    a single 'text' block in the format:
+    "<|instruction|>\n{instruction}\n\n<|input|>\n{java_code}\n\n<|response|>\n{json_output}"
+    Configured for Causal LM training where target labels match input IDs.
     """
     def __init__(
         self,
         jsonl_path: Union[str, Path],
         tokenizer: PreTrainedTokenizer,
-        max_length: int = 1024,
-        mask_prompt: bool = True
+        max_length: int = 2048
     ) -> None:
         """
-        Initializes the dataset.
-        
+        Initializes the dataset and loads data records.
+
         Args:
-            jsonl_path: Path to the JSONL dataset.
+            jsonl_path: Path to the JSONL dataset file.
             tokenizer: Pretrained tokenizer from Hugging Face.
             max_length: Maximum token sequence length for truncation.
-            mask_prompt: If True, prompt tokens will be set to -100 in labels so the loss is computed 
-                         only on the response tokens.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.mask_prompt = mask_prompt
-        self.examples: List[Dict[str, str]] = []
+        self.examples: List[str] = []
 
+        # Ensure pad_token_id is configured correctly
+        if self.tokenizer.pad_token_id is None:
+            logger.info("Tokenizer pad_token_id is missing. Falling back to eos_token_id.")
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            if self.tokenizer.pad_token_id is None:
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        # Read JSONL file and extract the 'text' field
+        jsonl_path = Path(jsonl_path)
         try:
-            logger.info(f"Loading dataset from {jsonl_path}")
-            with open(jsonl_path, "r", encoding="utf-8") as f:
-                for line_idx, line in enumerate(f):
+            logger.info(f"Attempting to load dataset from: {jsonl_path}")
+            if not jsonl_path.exists():
+                raise FileNotFoundError(f"Dataset path does not exist: {jsonl_path}")
+
+            with open(jsonl_path, "r", encoding="utf-8") as file:
+                for line_idx, line in enumerate(file, 1):
                     if not line.strip():
                         continue
                     try:
-                        data = json.loads(line)
-                        if "vuln_code" in data and "fixed_code" in data:
-                            self.examples.append({
-                                "vuln_code": data["vuln_code"],
-                                "fixed_code": data["fixed_code"],
-                                "description": data.get("description", "")
-                            })
+                        data: Dict[str, Any] = json.loads(line)
+                        if "text" in data:
+                            self.examples.append(data["text"])
                         else:
                             logger.warning(
-                                f"Skipping line {line_idx + 1}: Missing 'vuln_code' or 'fixed_code'"
+                                f"Skipping line {line_idx} in {jsonl_path.name}: 'text' key not found."
                             )
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Error parsing JSON on line {line_idx + 1}: {e}")
-            logger.info(f"Loaded {len(self.examples)} records successfully.")
-        except Exception as e:
-            logger.error(f"Failed to read dataset from {jsonl_path}: {e}")
+                    except json.JSONDecodeError as decode_err:
+                        logger.error(
+                            f"JSON parse failure on line {line_idx} in {jsonl_path.name}: {decode_err}"
+                        )
+            
+            logger.info(f"Successfully loaded {len(self.examples)} examples from {jsonl_path.name}")
+        except Exception as err:
+            logger.error(f"Failed to read dataset from {jsonl_path}: {err}", exc_info=True)
             raise
 
     def __len__(self) -> int:
@@ -81,109 +81,70 @@ class JavaVulnerabilityDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Prepares a single training sample by formatting the prompt,
-        tokenizing, padding/truncating, and establishing labels.
+        Retrieves a single sample, tokenizes it, manages sequence lengths,
+        and sets labels matching the input IDs for Causal LM training.
         """
-        example = self.examples[idx]
-        vuln_code = example["vuln_code"]
-        fixed_code = example["fixed_code"]
-
-        # 1. Format the instruction/input prompt (excluding response)
-        prompt_text = f"{PROMPT_INSTRUCTION}{INPUT_TEMPLATE.format(vuln_code=vuln_code)}### Response:\n"
-        # 2. Format the target response
-        response_text = fixed_code
-
+        text = self.examples[idx]
         try:
-            # Tokenize the prompt and response separately
-            prompt_enc = self.tokenizer(
-                prompt_text,
-                add_special_tokens=False,
-                truncation=False
-            )
-            response_enc = self.tokenizer(
-                response_text,
-                add_special_tokens=False,
-                truncation=False
+            # Tokenize complete block with strict length limit
+            encodings = self.tokenizer(
+                text,
+                max_length=self.max_length,
+                truncation=True,
+                padding=False,
+                add_special_tokens=True,
+                return_tensors=None
             )
 
-            # Determine BOS token inclusion
-            bos_token_id = self.tokenizer.bos_token_id
-            bos_tokens = [bos_token_id] if bos_token_id is not None else []
+            input_ids: List[int] = encodings["input_ids"]
+            attention_mask: List[int] = encodings["attention_mask"]
 
-            # Determine EOS token inclusion
-            eos_token_id = self.tokenizer.eos_token_id
-            eos_tokens = [eos_token_id] if eos_token_id is not None else []
+            # Causal LM training: labels are aligned with input_ids.
+            # PyTorch's CrossEntropyLoss ignores targets with value -100.
+            # Pad tokens will be masked in the collator.
+            labels: List[int] = list(input_ids)
 
-            prompt_ids = bos_tokens + prompt_enc["input_ids"]
-            response_ids = response_enc["input_ids"] + eos_tokens
-
-            # Truncation logic if standard sequence length exceeded
-            total_len = len(prompt_ids) + len(response_ids)
-            if total_len > self.max_length:
-                # Truncate response tokens to preserve the prompt input as much as possible
-                excess = total_len - self.max_length
-                if excess < len(response_ids):
-                    response_ids = response_ids[:-excess]
-                else:
-                    # If prompt is extremely long, truncate prompt itself
-                    prompt_ids = prompt_ids[:self.max_length - 1]
-                    response_ids = eos_tokens  # Keep at least EOS if response is completely truncated
-
-            # Combine input ids and establish attention mask
-            input_ids = prompt_ids + response_ids
-            attention_mask = [1] * len(input_ids)
-
-            # Labels for Causal LM training:
-            # -100 instructs PyTorch CrossEntropyLoss to ignore these targets.
-            if self.mask_prompt:
-                labels = [-100] * len(prompt_ids) + response_ids
-            else:
-                labels = input_ids.copy()
-
-            # Dynamic padding to max_length will be handled by a PyTorch DataCollator.
-            # But we cast to tensors here for PyTorch loader compatibility.
             return {
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),
                 "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
                 "labels": torch.tensor(labels, dtype=torch.long)
             }
-        except Exception as e:
-            logger.error(f"Error during tokenization of example index {idx}: {e}")
+        except Exception as err:
+            logger.error(f"Tokenization failed for dataset item at index {idx}: {err}", exc_info=True)
             raise
 
 
 class CausalLMDataCollator:
     """
-    Custom collator to dynamically pad batch inputs to the max length present in the batch.
+    Data Collator to dynamically pad batches to the maximum sequence length
+    present in the current batch. Configures padding and masks label padding positions to -100.
     """
     def __init__(self, tokenizer: PreTrainedTokenizer) -> None:
         self.tokenizer = tokenizer
-        # Set pad token if not defined
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            if self.tokenizer.pad_token_id is None:
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
     def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        # Find maximum length in this batch
-        lengths = [x["input_ids"].size(0) for x in batch]
-        max_len = max(lengths)
-
-        batch_input_ids = []
-        batch_attention_mask = []
-        batch_labels = []
-
+        # Find maximum length in the current batch
+        max_len = max(item["input_ids"].size(0) for item in batch)
+        
+        batch_input_ids: List[torch.Tensor] = []
+        batch_attention_mask: List[torch.Tensor] = []
+        batch_labels: List[torch.Tensor] = []
+        
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
-            raise ValueError("Tokenizer must have a valid pad_token_id.")
-
-        # Determine padding side (causal LMs usually prefer right-padding for training, 
-        # but left-padding is mandatory for batch inference. HuggingFace Trainer supports standard right-pad).
+            raise ValueError("Tokenizer must possess a valid, configured pad_token_id.")
+            
         padding_side = getattr(self.tokenizer, "padding_side", "right")
 
         for item in batch:
             input_ids = item["input_ids"]
             attention_mask = item["attention_mask"]
             labels = item["labels"]
-
+            
             diff = max_len - input_ids.size(0)
             if diff > 0:
                 pad_ids = torch.full((diff,), pad_token_id, dtype=torch.long)
@@ -217,33 +178,53 @@ class CausalLMDataCollator:
 def generate_mock_jsonl(path: Path) -> None:
     """
     Generates a sample JSONL file containing mock Java vulnerability examples
-    for verification and testing purposes.
+    in the expected format for verification purposes.
     """
     mock_data = [
         {
-            "vuln_code": "public void process(String input) throws Exception {\n    Connection conn = DriverManager.getConnection(DB_URL);\n    Statement stmt = conn.createStatement();\n    ResultSet rs = stmt.executeQuery(\"SELECT * FROM users WHERE username = '\" + input + \"'\");\n}",
-            "description": "SQL Injection vulnerability due to dynamic query building.",
-            "fixed_code": "public void process(String input) throws Exception {\n    Connection conn = DriverManager.getConnection(DB_URL);\n    String sql = \"SELECT * FROM users WHERE username = ?\";\n    PreparedStatement stmt = conn.prepareStatement(sql);\n    stmt.setString(1, input);\n    ResultSet rs = stmt.executeQuery();\n}"
+            "text": (
+                "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. Return structured JSON only.\n\n"
+                "<|input|>\npublic void process(String input) throws Exception {\n"
+                "    Connection conn = DriverManager.getConnection(DB_URL);\n"
+                "    Statement stmt = conn.createStatement();\n"
+                "    ResultSet rs = stmt.executeQuery(\"SELECT * FROM users WHERE username = '\" + input + \"'\");\n"
+                "}\n\n"
+                "<|response|>\n{\n  \"vulnerabilities\": [\n    {\n      \"cwe_id\": \"CWE-89\",\n"
+                "      \"cwe_name\": \"SQL Injection\",\n      \"severity\": \"high\",\n"
+                "      \"description\": \"SQL Injection vulnerability due to dynamic query building.\"\n"
+                "    }\n  ]\n}"
+            )
         },
         {
-            "vuln_code": "public void handle(HttpServletRequest req) {\n    String path = req.getParameter(\"path\");\n    File file = new File(\"/var/uploads/\" + path);\n    FileInputStream fis = new FileInputStream(file);\n}",
-            "description": "Path Traversal vulnerability via uncontrolled parameters.",
-            "fixed_code": "public void handle(HttpServletRequest req) {\n    String path = req.getParameter(\"path\");\n    File file = new File(\"/var/uploads/\" + path);\n    String canonicalPath = file.getCanonicalPath();\n    if (!canonicalPath.startsWith(\"/var/uploads/\")) {\n        throw new SecurityException(\"Unauthorized path access\");\n    }\n    FileInputStream fis = new FileInputStream(file);\n}"
+            "text": (
+                "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. Return structured JSON only.\n\n"
+                "<|input|>\npublic void handle(HttpServletRequest req) {\n"
+                "    String path = req.getParameter(\"path\");\n"
+                "    File file = new File(\"/var/uploads/\" + path);\n"
+                "    FileInputStream fis = new FileInputStream(file);\n"
+                "}\n\n"
+                "<|response|>\n{\n  \"vulnerabilities\": [\n    {\n      \"cwe_id\": \"CWE-22\",\n"
+                "      \"cwe_name\": \"Path Traversal\",\n      \"severity\": \"high\",\n"
+                "      \"description\": \"Path Traversal vulnerability via uncontrolled parameters.\"\n"
+                "    }\n  ]\n}"
+            )
         }
     ]
-    with open(path, "w", encoding="utf-8") as f:
-        for entry in mock_data:
-            f.write(json.dumps(entry) + "\n")
-    logger.info(f"Generated mock JSONL dataset at: {path}")
+    try:
+        with open(path, "w", encoding="utf-8") as file:
+            for entry in mock_data:
+                file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        logger.info(f"Generated mock JSONL dataset at: {path}")
+    except Exception as err:
+        logger.error(f"Failed to generate mock dataset at {path}: {err}", exc_info=True)
 
 
 if __name__ == "__main__":
-    # Sanity check validation run
     import argparse
     from transformers import AutoTokenizer
 
     parser = argparse.ArgumentParser(description="Test and Verify Data Preparation")
-    parser.add_argument("--test_file", type=str, default="test_dataset.jsonl", help="Path to JSONL output/test file")
+    parser.add_argument("--test_file", type=str, default="test_dataset_prepared.jsonl", help="Path to JSONL output/test file")
     parser.add_argument("--tokenizer_name", type=str, default="bigcode/starcoder2-3b", help="Hugging Face tokenizer ID")
     args = parser.parse_args()
 
@@ -251,11 +232,11 @@ if __name__ == "__main__":
     generate_mock_jsonl(test_path)
 
     try:
-        logger.info(f"Loading local/remote tokenizer: {args.tokenizer_name}")
+        logger.info(f"Loading tokenizer: {args.tokenizer_name}")
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
         
         # Instantiate dataset
-        dataset = JavaVulnerabilityDataset(test_path, tokenizer, max_length=512)
+        dataset = JavaVulnerabilityDataset(test_path, tokenizer, max_length=1024)
         collator = CausalLMDataCollator(tokenizer)
         
         # Test loading first element
@@ -270,8 +251,8 @@ if __name__ == "__main__":
         logger.info(f"Batch Input IDs shape: {batch['input_ids'].shape}")
         logger.info(f"Batch Labels shape: {batch['labels'].shape}")
 
-    except Exception as err:
-        logger.error(f"Verification execution failed: {err}")
+    except Exception as e:
+        logger.error(f"Verification execution failed: {e}", exc_info=True)
     finally:
         if test_path.exists():
             test_path.unlink()
