@@ -84,13 +84,44 @@ python inference_engine.py \
 ```
 
 ### 3. Scan a Codebase
-To recursively scan a directory containing Java source files:
+To recursively scan a directory containing Java source files using the fine-tuned model:
 ```bash
 python scanner.py \
     --model_id "bigcode/starcoder2-3b" \
     --adapter_path "./adapters" \
     --target_dir "path/to/java/project" \
-    --output_report "vulnerability_report.json"
+    --output_report "vulnerability_report.json" \
+    --max_chunk_lines 100
+```
+
+#### CLI Parameters:
+- `--model_id` (required): Base Hugging Face model identifier (e.g., `bigcode/starcoder2-3b`).
+- `--adapter_path` (required): Path to the directory containing fine-tuned LoRA adapter checkpoints.
+- `--target_dir` (required): Path to the target Java codebase directory to scan.
+- `--output_report` (optional, default: `vulnerability_report.json`): Destination path for the structured JSON scan report.
+- `--max_chunk_lines` (optional, default: `100`): Maximum lines of code per chunk analyzed by the model.
+
+#### Output Report Format:
+The scanner parses the model's structured JSON response and compiles the results into a file containing findings structured as follows:
+```json
+{
+    "target_directory": "/home/user/workspace/target-project",
+    "total_files_scanned": 15,
+    "vulnerabilities_count": 1,
+    "findings": [
+        {
+            "file_path": "src/main/java/DBConnection.java",
+            "start_line": 12,
+            "end_line": 28,
+            "cwe_id": "CWE-522",
+            "cwe_name": "Hard Coded Password (CWE-522)",
+            "severity": "high",
+            "confidence": 0.96,
+            "description": "The method bad contains a vulnerability associated with Hard Coded Password.",
+            "original_code": "..."
+        }
+    ]
+}
 ```
 
 ---

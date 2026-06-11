@@ -297,8 +297,6 @@ def run_codebase_scan(
                             "severity": vuln.get("severity", ""),
                             "confidence": vuln.get("confidence", 1.0),
                             "description": vuln.get("description", ""),
-                            "impact": vuln.get("impact", ""),
-                            "recommendation": vuln.get("recommendation", ""),
                             "original_code": original_code
                         })
                 else:
@@ -319,8 +317,7 @@ def run_codebase_scan(
                             "start_line": chunk["start_line"],
                             "end_line": chunk["end_line"],
                             "suspected_vulnerability": "Flagged by fallback heuristic",
-                            "original_code": original_code,
-                            "suggested_remediation": result
+                            "original_code": original_code
                         })
 
         except Exception as file_err:
