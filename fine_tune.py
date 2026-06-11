@@ -12,6 +12,7 @@ from transformers import (
     Trainer,
     TrainingArguments
 )
+
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -166,7 +167,7 @@ def run_training(
             lr_scheduler_type="cosine",
             logging_steps=10,
             save_strategy="epoch",
-            evaluation_strategy="epoch" if eval_dataset else "no",
+            eval_strategy="epoch" if eval_dataset else "no",
             bf16=(is_cuda and compute_dtype == torch.bfloat16),
             fp16=(is_cuda and compute_dtype == torch.float16),
             optim="paged_adamw_8bit" if is_cuda else "adamw_torch",

@@ -74,6 +74,12 @@ python fine_tune.py \
     --batch_size 4
 ```
 
+python export_model.py \
+    --model_id "bigcode/starcoder2-3b" \
+    --adapter_path "./adapters" \
+    --output_dir "./merged_offline_model"
+
+
 ### 2. Run Single Code Snippet Inference
 To test the analysis of a specific code snippet with base + adapter model:
 ```bash
@@ -82,6 +88,15 @@ python inference_engine.py \
     --adapter_path "./adapters" \
     --snippet_path "path/to/Snippet.java"
 ```
+python inference_engine.py \
+    --model_id "./merged_offline_model" \
+    --snippet_path "path/to/Snippet.java"
+
+python inference_engine.py \
+    --model_id "./merged_offline_model" \
+    --snippet_path "path/to/Snippet.java" \
+    --format json
+
 
 ### 3. Scan a Codebase
 To recursively scan a directory containing Java source files:

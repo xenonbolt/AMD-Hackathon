@@ -45,9 +45,16 @@ class VulnerabilityInferenceEngine:
         self.adapter_path = adapter_path
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # Check if model_id is a local directory containing a merged model
+        is_local = Path(model_id).is_dir()
+
         try:
-            logger.info(f"Loading tokenizer for model: {model_id}")
-            self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            logger.info(f"Loading tokenizer for model: {model_id} (local: {is_local})")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                local_files_only=is_local
+            )
             if self.tokenizer.pad_token_id is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
                 if self.tokenizer.pad_token_id is None:
@@ -70,12 +77,13 @@ class VulnerabilityInferenceEngine:
             else:
                 logger.warning("BitsAndBytes 4-bit is disabled or CUDA is unavailable. Loading base model in full precision.")
 
-            logger.info(f"Loading base model: {model_id}")
+            logger.info(f"Loading base/merged model: {model_id} (local: {is_local})")
             base_model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 quantization_config=bnb_config,
                 device_map=device_map,
-                trust_remote_code=True
+                trust_remote_code=True,
+                local_files_only=is_local
             )
 
             # Apply PEFT adapter if provided
@@ -83,7 +91,10 @@ class VulnerabilityInferenceEngine:
                 logger.info(f"Overlaying PEFT adapter from path: {self.adapter_path}")
                 self.model = PeftModel.from_pretrained(base_model, str(self.adapter_path))
             else:
-                logger.warning("No PEFT adapter specified. Running raw base model.")
+                if is_local:
+                    logger.info("No adapter path specified. Using local model directly (assumed merged/standalone).")
+                else:
+                    logger.warning("No PEFT adapter specified. Running raw base model.")
                 self.model = base_model
 
             self.model.eval()
@@ -125,19 +136,9 @@ class VulnerabilityInferenceEngine:
                     pad_token_id=self.tokenizer.pad_token_id
                 )
 
-            # Decode output sequence
-            decoded_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-            # 3. Use an end-of-sequence stopper to cut off generation cleanly
-            # We slice the text generated *after* the response marker to isolate the JSON block
-            response_marker = "<|response|>\n"
-            marker_idx = decoded_output.find(response_marker)
-            if marker_idx != -1:
-                generated_response = decoded_output[marker_idx + len(response_marker):].strip()
-            else:
-                # Fallback if marker is missing: slice by prompt length
-                clean_prompt = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                generated_response = decoded_output[len(clean_prompt):].strip()
+            # 3. Extract and decode ONLY the generated tokens (excluding the prompt tokens)
+            generated_tokens = outputs[0][len(input_ids[0]):]
+            generated_response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
             # Ensure we stop if the tokenizer EOS token is in string representation
             eos_token_str = self.tokenizer.eos_token
@@ -193,12 +194,93 @@ class VulnerabilityInferenceEngine:
             }
 
 
+def format_report_as_markdown(report: Dict[str, Any]) -> str:
+    """
+    Converts a structured vulnerability report dictionary into a user-readable Markdown string.
+    """
+    if "error" in report:
+        return (
+            f"# Vulnerability Scan Report\n\n"
+            f"❌ **Inference Error Encountered**\n\n"
+            f"> {report['error']}\n\n"
+            f"### Raw Response\n"
+            f"```text\n{report.get('raw_response', 'No raw response available.')}\n```\n"
+        )
+        
+    vulns = report.get("vulnerabilities", [])
+    if not vulns:
+        return (
+            f"# Vulnerability Scan Report\n\n"
+            f"✅ **No vulnerabilities detected!**\n\n"
+            f"The scan completed successfully and identified no security issues in the provided code.\n"
+        )
+        
+    md = []
+    md.append("# Vulnerability Scan Report\n")
+    md.append(f"### 📊 Summary: **{len(vulns)}** vulnerability/vulnerabilities detected.\n")
+    md.append("---")
+    
+    for idx, vuln in enumerate(vulns, 1):
+        cwe_id = vuln.get("cwe_id", "N/A")
+        cwe_name = vuln.get("cwe_name", "Unknown CWE")
+        severity = vuln.get("severity", "medium").upper()
+        confidence = vuln.get("confidence", "N/A")
+        description = vuln.get("description", "No description provided.")
+        impact = vuln.get("impact", "No impact details provided.")
+        recommendation = vuln.get("recommendation", "No recommendation provided.")
+        
+        # Determine a color/emoji for severity
+        sev_emoji = "⚪"
+        if severity == "CRITICAL":
+            sev_emoji = "🔴"
+        elif severity == "HIGH":
+            sev_emoji = "fiber_manual_record"
+            sev_emoji = "🔴"
+        elif severity == "MEDIUM":
+            sev_emoji = "🟡"
+        elif severity == "LOW":
+            sev_emoji = "🔵"
+            
+        md.append(f"\n## {idx}. {sev_emoji} {cwe_name} ({cwe_id})")
+        md.append(f"- **Severity**: `{severity}`")
+        if confidence != "N/A":
+            md.append(f"- **Confidence**: `{confidence}`")
+        
+        location = vuln.get("location", {})
+        if location:
+            loc_str = []
+            if "class" in location:
+                loc_str.append(f"Class: `{location['class']}`")
+            if "method" in location:
+                loc_str.append(f"Method: `{location['method']}`")
+            if "line" in location:
+                loc_str.append(f"Line: `{location['line']}`")
+            if loc_str:
+                md.append(f"- **Location**: {', '.join(loc_str)}")
+                
+        md.append(f"\n### 📝 Description\n{description}")
+        if impact and impact != "No impact details provided.":
+            md.append(f"\n### ⚠️ Impact\n{impact}")
+        md.append(f"\n### 💡 Recommendation\n{recommendation}")
+        
+        # If there is a fixed_code or remediation block, show it
+        if "fixed_code" in vuln:
+            md.append(f"\n#### Suggested Remediation Code:\n```java\n{vuln['fixed_code']}\n```")
+        elif "fixed_code" in report:  # fallback if model returned it at top level
+            md.append(f"\n#### Suggested Remediation Code:\n```java\n{report['fixed_code']}\n```")
+            
+        md.append("\n---")
+        
+    return "\n".join(md)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference Engine Verification")
-    parser.add_argument("--model_id", type=str, required=True, help="Base model identifier")
+    parser.add_argument("--model_id", type=str, required=True, help="Base model identifier or local merged model directory")
     parser.add_argument("--adapter_path", type=str, default=None, help="PEFT adapter weights directory")
     parser.add_argument("--snippet_path", type=str, required=True, help="Path to Java file snippet to scan")
     parser.add_argument("--no_quant", action="store_true", help="Disable 4-bit quantization")
+    parser.add_argument("--format", type=str, choices=["json", "markdown"], default="markdown", help="Output format (default: markdown)")
     args = parser.parse_args()
 
     snippet_file = Path(args.snippet_path)
@@ -219,11 +301,15 @@ if __name__ == "__main__":
         logger.info("Executing deterministic analysis on file contents...")
         report = engine.analyze_file_content(code_content)
 
-        print("\n" + "=" * 50)
-        print("INFERENCE VULNERABILITY REPORT:")
-        print("=" * 50)
-        print(json.dumps(report, indent=4))
-        print("=" * 50 + "\n")
+        if args.format == "markdown":
+            formatted_report = format_report_as_markdown(report)
+            print(formatted_report)
+        else:
+            print("\n" + "=" * 50)
+            print("INFERENCE VULNERABILITY REPORT (JSON):")
+            print("=" * 50)
+            print(json.dumps(report, indent=4))
+            print("=" * 50 + "\n")
 
     except Exception as e:
         logger.error(f"Verification run failed: {e}", exc_info=True)
