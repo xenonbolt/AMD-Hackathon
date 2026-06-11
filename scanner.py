@@ -15,6 +15,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scanner")
 
+CWE_METADATA = {
+    "CWE-22": {"name": "Path Traversal (CWE-22)", "severity": "high", "keywords": ["path traversal", "directory traversal"]},
+    "CWE-78": {"name": "OS Command Injection (CWE-78)", "severity": "critical", "keywords": ["command injection", "os command", "runtime.exec"]},
+    "CWE-79": {"name": "Cross-site Scripting (CWE-79)", "severity": "medium", "keywords": ["xss", "cross-site scripting", "cross site scripting"]},
+    "CWE-89": {"name": "SQL Injection (CWE-89)", "severity": "critical", "keywords": ["sql injection", "sqli"]},
+    "CWE-90": {"name": "LDAP Injection (CWE-90)", "severity": "critical", "keywords": ["ldap injection", "ldap"]},
+    "CWE-276": {"name": "Temporary File Creation With Insecure Perms (CWE-276)", "severity": "high", "keywords": ["insecure perms", "temporary file", "file creation"]},
+    "CWE-319": {"name": "Cleartext Transmission of Sensitive Information (CWE-319)", "severity": "high", "keywords": ["cleartext transmission", "unencrypted"]},
+    "CWE-321": {"name": "Use of Hard-coded Cryptographic Key (CWE-321)", "severity": "critical", "keywords": ["hard-coded cryptographic key", "hardcoded key"]},
+    "CWE-400": {"name": "Resource Exhaustion (CWE-400)", "severity": "high", "keywords": ["resource exhaustion", "denial of service"]},
+    "CWE-522": {"name": "Hard Coded Password (CWE-522)", "severity": "high", "keywords": ["hard coded password", "hardcoded password"]},
+    "CWE-601": {"name": "URL Redirection to Untrusted Site (CWE-601)", "severity": "medium", "keywords": ["url redirection", "open redirect", "untrusted site"]},
+    "CWE-643": {"name": "XPath Injection (CWE-643)", "severity": "high", "keywords": ["xpath injection"]},
+    "CWE-918": {"name": "Server-Side Request Forgery (CWE-918)", "severity": "critical", "keywords": ["ssrf", "server-side request forgery"]},
+}
+
 
 def extract_java_blocks(code: str) -> List[Dict[str, Any]]:
     """
@@ -249,11 +265,13 @@ def run_codebase_scan(
                 
                 # Attempt to parse structured JSON vulnerabilities from result
                 vulnerabilities = []
+                json_parsed = False
                 result_clean = result.strip()
                 try:
                     data = json.loads(result_clean)
                     if isinstance(data, dict) and "vulnerabilities" in data:
                         vulnerabilities = data["vulnerabilities"]
+                        json_parsed = True
                 except json.JSONDecodeError:
                     # Try to extract JSON from markdown or raw regex match
                     for pattern in [r"```json\s*(\{.*?\})\s*```", r"```\s*(\{.*?\})\s*```", r"(\{.*\})"]:
@@ -263,17 +281,19 @@ def run_codebase_scan(
                                 data = json.loads(match.group(1).strip())
                                 if isinstance(data, dict) and "vulnerabilities" in data:
                                     vulnerabilities = data["vulnerabilities"]
+                                    json_parsed = True
                                     break
                             except json.JSONDecodeError:
                                 pass
 
-                # If vulnerabilities are parsed, extract them
-                if vulnerabilities:
-                    logger.warning(
-                        f"SUSPECTED VULNERABILITIES flagged in {file_path.name} "
-                        f"(Lines {chunk['start_line']}-{chunk['end_line']})"
-                    )
-                    for vuln in vulnerabilities:
+                # If JSON was parsed, process vulnerabilities (if any)
+                if json_parsed:
+                    if vulnerabilities:
+                        logger.warning(
+                            f"SUSPECTED VULNERABILITIES flagged in {file_path.name} "
+                            f"(Lines {chunk['start_line']}-{chunk['end_line']})"
+                        )
+                        for vuln in vulnerabilities:
                         # Extract location info relative to chunk start
                         loc = vuln.get("location", {})
                         # Location lines are 1-based relative to block. Absolute lines:
@@ -312,11 +332,29 @@ def run_codebase_scan(
                             vulnerability_found = True
                     
                     if vulnerability_found:
+                        cwe_match = re.search(r'(CWE-\d+)', result, re.IGNORECASE)
+                        cwe_id = cwe_match.group(1).upper() if cwe_match else None
+                        
+                        if not cwe_id:
+                            # Try keyword matching against the unstructured text
+                            lower_result = result.lower()
+                            for mapped_cwe, mapped_info in CWE_METADATA.items():
+                                if any(kw in lower_result for kw in mapped_info.get("keywords", [])):
+                                    cwe_id = mapped_cwe
+                                    break
+                                    
+                        cwe_id = cwe_id or "Unknown"
+                        cwe_info = CWE_METADATA.get(cwe_id, {"name": "Unknown", "severity": "Unknown"})
+
                         findings.append({
                             "file_path": str(file_path.relative_to(target_path.parent)),
                             "start_line": chunk["start_line"],
                             "end_line": chunk["end_line"],
-                            "suspected_vulnerability": "Flagged by fallback heuristic",
+                            "cwe_id": cwe_id,
+                            "cwe_name": cwe_info["name"],
+                            "severity": cwe_info["severity"],
+                            "confidence": 0.5,
+                            "description": "Vulnerability identified by fallback heuristic.",
                             "original_code": original_code
                         })
 

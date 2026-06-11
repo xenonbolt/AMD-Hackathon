@@ -67,7 +67,7 @@ A static analysis tool that recursively walks directories to locate `.java` file
 To initiate 4-bit quantized training using PEFT LoRA adapters:
 ```bash
 python fine_tune.py \
-    --model_id "bigcode/starcoder2-3b" \
+    --model_id "deepseek-ai/deepseek-coder-6.7b-base" \
     --dataset_path "vuln_dataset.jsonl" \
     --output_dir "./adapters" \
     --epochs 3 \
@@ -78,7 +78,7 @@ python fine_tune.py \
 To test the analysis of a specific code snippet with base + adapter model:
 ```bash
 python inference_engine.py \
-    --model_id "bigcode/starcoder2-3b" \
+    --model_id "deepseek-ai/deepseek-coder-6.7b-base" \
     --adapter_path "./adapters" \
     --snippet_path "path/to/Snippet.java"
 ```
@@ -87,7 +87,7 @@ python inference_engine.py \
 To recursively scan a directory containing Java source files using the fine-tuned model:
 ```bash
 python scanner.py \
-    --model_id "bigcode/starcoder2-3b" \
+    --model_id "deepseek-ai/deepseek-coder-6.7b-base" \
     --adapter_path "./adapters" \
     --target_dir "path/to/java/project" \
     --output_report "vulnerability_report.json" \
