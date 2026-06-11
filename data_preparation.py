@@ -63,11 +63,19 @@ class JavaVulnerabilityDataset(Dataset):
                             self.examples.append({
                                 "vuln_code": data["vuln_code"],
                                 "fixed_code": data["fixed_code"],
-                                "description": data.get("description", "")
+                                "description": data.get("description", ""),
+                                "instruction": data.get("instruction", "")
+                            })
+                        elif "instruction" in data and "input" in data and ("output" in data or "response" in data):
+                            self.examples.append({
+                                "vuln_code": data["input"],
+                                "fixed_code": data.get("output") or data.get("response", ""),
+                                "description": data.get("description", ""),
+                                "instruction": data["instruction"]
                             })
                         else:
                             logger.warning(
-                                f"Skipping line {line_idx + 1}: Missing 'vuln_code' or 'fixed_code'"
+                                f"Skipping line {line_idx + 1}: Missing expected dataset fields ('vuln_code'/'fixed_code' or 'instruction'/'input'/'output'/'response')"
                             )
                     except json.JSONDecodeError as e:
                         logger.error(f"Error parsing JSON on line {line_idx + 1}: {e}")
@@ -89,7 +97,14 @@ class JavaVulnerabilityDataset(Dataset):
         fixed_code = example["fixed_code"]
 
         # 1. Format the instruction/input prompt (excluding response)
-        prompt_text = f"{PROMPT_INSTRUCTION}{INPUT_TEMPLATE.format(vuln_code=vuln_code)}### Response:\n"
+        custom_instruction = example.get("instruction", "")
+        if custom_instruction:
+            if custom_instruction.startswith("### Instruction:"):
+                prompt_text = f"{custom_instruction}\n\n{INPUT_TEMPLATE.format(vuln_code=vuln_code)}### Response:\n"
+            else:
+                prompt_text = f"### Instruction: {custom_instruction}\n\n{INPUT_TEMPLATE.format(vuln_code=vuln_code)}### Response:\n"
+        else:
+            prompt_text = f"{PROMPT_INSTRUCTION}{INPUT_TEMPLATE.format(vuln_code=vuln_code)}### Response:\n"
         # 2. Format the target response
         response_text = fixed_code
 

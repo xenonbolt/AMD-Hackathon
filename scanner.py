@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
@@ -246,38 +247,81 @@ def run_codebase_scan(
                 original_code = chunk["content"]
                 result = engine.analyze_snippet(original_code)
                 
-                # Deduce if a vulnerability is flagged
-                # Clean whitespace/formatting to avoid false positives in change detection
-                clean_orig = "".join(original_code.split())
-                clean_res = "".join(result.split())
-                
-                # If remediation code differs or mentions vulnerability terms
-                vulnerability_found = False
-                vulnerability_keywords = ["vuln", "vulnerability", "remediation", "exploit", "unsafe", "security"]
-                
-                if clean_orig != clean_res:
-                    # Verify it's not a generic response saying "no vulnerability"
-                    lower_res = result.lower()
-                    if not any(phrase in lower_res for phrase in ["no vulnerability", "secure", "safe code", "no issues"]):
-                        vulnerability_found = True
-                else:
-                    # Check if output contains explicit vulnerability explanations without rewriting
-                    if any(kw in result.lower() for kw in vulnerability_keywords) and "no vulnerability" not in result.lower():
-                        vulnerability_found = True
+                # Attempt to parse structured JSON vulnerabilities from result
+                vulnerabilities = []
+                result_clean = result.strip()
+                try:
+                    data = json.loads(result_clean)
+                    if isinstance(data, dict) and "vulnerabilities" in data:
+                        vulnerabilities = data["vulnerabilities"]
+                except json.JSONDecodeError:
+                    # Try to extract JSON from markdown or raw regex match
+                    for pattern in [r"```json\s*(\{.*?\})\s*```", r"```\s*(\{.*?\})\s*```", r"(\{.*\})"]:
+                        match = re.search(pattern, result_clean, re.DOTALL)
+                        if match:
+                            try:
+                                data = json.loads(match.group(1).strip())
+                                if isinstance(data, dict) and "vulnerabilities" in data:
+                                    vulnerabilities = data["vulnerabilities"]
+                                    break
+                            except json.JSONDecodeError:
+                                pass
 
-                if vulnerability_found:
+                # If vulnerabilities are parsed, extract them
+                if vulnerabilities:
                     logger.warning(
-                        f"SUSPECTED VULNERABILITY flagged in {file_path.name} "
+                        f"SUSPECTED VULNERABILITIES flagged in {file_path.name} "
                         f"(Lines {chunk['start_line']}-{chunk['end_line']})"
                     )
-                    findings.append({
-                        "file_path": str(file_path.relative_to(target_path.parent)),
-                        "start_line": chunk["start_line"],
-                        "end_line": chunk["end_line"],
-                        "suspected_vulnerability": "Flagged by model inference",
-                        "original_code": original_code,
-                        "suggested_remediation": result
-                    })
+                    for vuln in vulnerabilities:
+                        # Extract location info relative to chunk start
+                        loc = vuln.get("location", {})
+                        # Location lines are 1-based relative to block. Absolute lines:
+                        # Handle missing or invalid location details gracefully
+                        try:
+                            start_offset = int(loc.get("start_line", 1)) - 1
+                            end_offset = int(loc.get("end_line", 1)) - 1
+                        except (ValueError, TypeError):
+                            start_offset = 0
+                            end_offset = chunk["end_line"] - chunk["start_line"]
+                            
+                        vuln_start = chunk["start_line"] + start_offset
+                        vuln_end = chunk["start_line"] + end_offset
+
+                        findings.append({
+                            "file_path": str(file_path.relative_to(target_path.parent)),
+                            "start_line": vuln_start,
+                            "end_line": vuln_end,
+                            "cwe_id": vuln.get("cwe_id", ""),
+                            "cwe_name": vuln.get("cwe_name", ""),
+                            "severity": vuln.get("severity", ""),
+                            "confidence": vuln.get("confidence", 1.0),
+                            "description": vuln.get("description", ""),
+                            "impact": vuln.get("impact", ""),
+                            "recommendation": vuln.get("recommendation", ""),
+                            "original_code": original_code
+                        })
+                else:
+                    # Fallback heuristic: check if output suggests any vulnerability keywords
+                    # or is not just code matching original or indicating "no vulnerability"
+                    clean_orig = "".join(original_code.split())
+                    clean_res = "".join(result.split())
+                    vulnerability_found = False
+                    
+                    if clean_orig != clean_res and result:
+                        lower_res = result.lower()
+                        if not any(phrase in lower_res for phrase in ["no vulnerability", "secure", "safe code", "no issues"]):
+                            vulnerability_found = True
+                    
+                    if vulnerability_found:
+                        findings.append({
+                            "file_path": str(file_path.relative_to(target_path.parent)),
+                            "start_line": chunk["start_line"],
+                            "end_line": chunk["end_line"],
+                            "suspected_vulnerability": "Flagged by fallback heuristic",
+                            "original_code": original_code,
+                            "suggested_remediation": result
+                        })
 
         except Exception as file_err:
             logger.error(f"Failed to scan file {file_path}: {file_err}", exc_info=True)

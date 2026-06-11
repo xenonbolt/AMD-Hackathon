@@ -15,8 +15,8 @@ logging.basicConfig(
 logger = logging.getLogger("inference_engine")
 
 PROMPT_TEMPLATE = (
-    "### Instruction: Analyze the following Java code for vulnerabilities. "
-    "If a vulnerability exists, identify it and provide the remediated code.\n\n"
+    "### Instruction: Analyze the Java code and identify ALL security vulnerabilities. "
+    "Return structured JSON only.\n\n"
     "### Input:\n{vuln_code}\n\n"
     "### Response:\n"
 )
