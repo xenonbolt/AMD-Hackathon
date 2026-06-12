@@ -15,8 +15,14 @@ logging.basicConfig(
 logger = logging.getLogger("inference_engine")
 
 PROMPT_TEMPLATE = (
-    "### Instruction: Analyze the following Java code for vulnerabilities. "
-    "If a vulnerability exists, identify it.\n\n"
+    "### Instruction: Analyze the following Java code for security vulnerabilities. "
+    "If a vulnerability exists, respond with a JSON object in this exact format:\n"
+    '{{"vulnerabilities": [{{"cwe_id": "CWE-XXX", "cwe_name": "...", '
+    '"severity": "critical|high|medium|low", "confidence": 0.0-1.0, '
+    '"description": "...", "location": {{"start_line": 1, "end_line": 1}}}}]}}\n'
+    "If no vulnerability exists, respond with: "
+    '{{"vulnerabilities": []}}\n'
+    "Respond with JSON only. No explanation outside the JSON.\n\n"
     "### Input:\n{vuln_code}\n\n"
     "### Response:\n"
 )
@@ -251,8 +257,53 @@ class VulnerabilityInferenceEngine:
                 try:
                     parsed = json.loads(raw_response)
                 except json.JSONDecodeError:
-                    logger.warning("Verifier: could not parse JSON response; using safe default.")
-                    return _SAFE_DEFAULT
+                    logger.warning(
+                        "Verifier: could not parse JSON response; "
+                        "falling back to natural-language signal detection."
+                    )
+                    # Natural-language fallback: scan the raw text for explicit
+                    # safe/vulnerable signals so we don't blindly keep everything.
+                    lower_raw = raw_response.lower()
+                    NL_SAFE_SIGNALS = [
+                        "not vulnerable", "no vulnerability", "no vulnerabilities",
+                        "false positive", "not a vulnerability", "safe code",
+                        "no security issue", "benign", "no exploit", "no issue",
+                        "no security concern", "not exploitable"
+                    ]
+                    NL_VULN_SIGNALS = [
+                        "vulnerable", "vulnerability", "vulnerabilities",
+                        "cwe-", "injection", "traversal", "forgery",
+                        "overflow", "xss", "ssrf", "hardcoded", "insecure",
+                        "exploit", "attacker", "arbitrary code", "true positive"
+                    ]
+                    has_safe = any(s in lower_raw for s in NL_SAFE_SIGNALS)
+                    has_vuln = any(v in lower_raw for v in NL_VULN_SIGNALS)
+
+                    if has_safe and not has_vuln:
+                        # Model clearly says it's safe
+                        return {
+                            "is_vulnerable": False,
+                            "cwe_id": None,
+                            "cwe_name": None,
+                            "severity": None,
+                            "confidence": 0.7,
+                            "reason": "Verifier NL fallback: model response indicated safe/not-vulnerable."
+                        }
+                    elif has_vuln and not has_safe:
+                        # Model clearly says it's vulnerable — extract CWE if present
+                        cwe_match = re.search(r'(CWE-\d+)', raw_response, re.IGNORECASE)
+                        nl_cwe_id = cwe_match.group(1).upper() if cwe_match else None
+                        return {
+                            "is_vulnerable": True,
+                            "cwe_id": nl_cwe_id,
+                            "cwe_name": None,
+                            "severity": None,
+                            "confidence": 0.6,
+                            "reason": "Verifier NL fallback: model response indicated vulnerability."
+                        }
+                    else:
+                        # Ambiguous — use conservative safe default
+                        return _SAFE_DEFAULT
 
             # Normalise and validate fields
             is_vulnerable = bool(parsed.get("is_vulnerable", True))

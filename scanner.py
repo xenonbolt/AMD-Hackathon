@@ -319,21 +319,36 @@ def run_codebase_scan(
                                 "original_code": original_code
                             })
                 else:
-                    # Fallback heuristic: check if output suggests any vulnerability keywords
-                    # or is not just code matching original or indicating "no vulnerability"
-                    clean_orig = "".join(original_code.split())
-                    clean_res = "".join(result.split())
+                    # Fallback heuristic: require the model output to contain EXPLICIT
+                    # vulnerability language before flagging. The old check (output != input)
+                    # was too loose — the model always generates some text, so everything
+                    # was flagged. Now we require at least one positive vulnerability signal.
+                    POSITIVE_VULN_KEYWORDS = [
+                        "vulnerab", "exploit", "injection", "cwe-", "cwe ",
+                        "overflow", "traversal", "forgery", "xss", "ssrf",
+                        "hardcoded", "hard-coded", "cleartext", "unencrypted",
+                        "command injection", "sql inject", "ldap inject",
+                        "path inject", "open redirect", "insecure",
+                        "attacker", "malicious", "arbitrary code"
+                    ]
+                    NEGATIVE_PHRASES = [
+                        "no vulnerability", "not vulnerable", "no vulnerabilities",
+                        "secure", "safe code", "no issues", "no security",
+                        "false positive", "benign", "no exploit"
+                    ]
+
                     vulnerability_found = False
-                    
-                    if clean_orig != clean_res and result:
+                    if result:
                         lower_res = result.lower()
-                        if not any(phrase in lower_res for phrase in ["no vulnerability", "secure", "safe code", "no issues"]):
+                        has_positive = any(kw in lower_res for kw in POSITIVE_VULN_KEYWORDS)
+                        has_negative = any(ph in lower_res for ph in NEGATIVE_PHRASES)
+                        if has_positive and not has_negative:
                             vulnerability_found = True
-                    
+
                     if vulnerability_found:
                         cwe_match = re.search(r'(CWE-\d+)', result, re.IGNORECASE)
                         cwe_id = cwe_match.group(1).upper() if cwe_match else None
-                        
+
                         if not cwe_id:
                             # Try keyword matching against the unstructured text
                             lower_result = result.lower()
@@ -341,7 +356,7 @@ def run_codebase_scan(
                                 if any(kw in lower_result for kw in mapped_info.get("keywords", [])):
                                     cwe_id = mapped_cwe
                                     break
-                                    
+
                         cwe_id = cwe_id or "Unknown"
                         cwe_info = CWE_METADATA.get(cwe_id, {"name": "Unknown", "severity": "Unknown"})
 
@@ -356,6 +371,12 @@ def run_codebase_scan(
                             "description": "Vulnerability identified by fallback heuristic.",
                             "original_code": original_code
                         })
+                    else:
+                        logger.debug(
+                            f"Fallback heuristic: no positive vulnerability signal in model "
+                            f"output for {file_path.name} lines "
+                            f"{chunk['start_line']}-{chunk['end_line']}. Skipping."
+                        )
 
         except Exception as file_err:
             logger.error(f"Failed to scan file {file_path}: {file_err}", exc_info=True)
