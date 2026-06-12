@@ -273,8 +273,11 @@ def run_codebase_scan(
                         vulnerabilities = data["vulnerabilities"]
                         json_parsed = True
                 except json.JSONDecodeError:
-                    # Try to extract JSON from markdown or raw regex match
-                    for pattern in [r"```json\s*(\{.*?\})\s*```", r"```\s*(\{.*?\})\s*```", r"(\{.*\})"]:
+                    # Try to extract JSON only from explicit markdown code fences.
+                    # NOTE: do NOT use a greedy r"({.*})" pattern here — Java code
+                    # is full of braces and would be mistakenly parsed as JSON,
+                    # setting json_parsed=True with empty vulnerabilities.
+                    for pattern in [r"```json\s*(\{.*?\})\s*```", r"```\s*(\{.*?\})\s*```"]:
                         match = re.search(pattern, result_clean, re.DOTALL)
                         if match:
                             try:
@@ -320,48 +323,33 @@ def run_codebase_scan(
                             })
                 else:
                     # -------------------------------------------------------
-                    # Fallback heuristic — the model outputs REMEDIATED CODE,
-                    # not JSON or text descriptions (it was trained on vuln→fix
-                    # pairs). A vulnerability is present when the model produces
-                    # meaningfully different code that introduces a security fix.
-                    #
-                    # Strategy:
-                    #   1. Compute a normalised token-level diff ratio.
-                    #   2. Require a minimum meaningful change (not just whitespace).
-                    #   3. Confirm the change is security-relevant by checking
-                    #      whether known remediation patterns appear in the output
-                    #      but NOT in the input (i.e., the model actually added them).
-                    #   4. Short/trivial snippets (constructors, DTOs, stubs) produce
-                    #      identical output → ratio ~0 → correctly skipped.
+                    # Fallback heuristic — the model was trained on vuln→fix
+                    # pairs and outputs REMEDIATED CODE as its response.
+                    # A vulnerability is flagged when the model meaningfully
+                    # rewrites the code (Jaccard token distance > 15%).
+                    # Simple boilerplate (constructors, DTOs, stubs) is echoed
+                    # back unchanged (ratio ≈00) and is correctly skipped.
+                    # Remediation signals are used only for CWE identification.
                     # -------------------------------------------------------
-
-                    # Security remediation patterns: things the model ADDS when fixing
                     REMEDIATION_SIGNALS = [
-                        # SQL Injection fix
-                        ("preparedstatement", "CWE-89"),
-                        ("setstring(", "CWE-89"), ("setint(", "CWE-89"),
-                        ("setlong(", "CWE-89"), ("setobject(", "CWE-89"),
-                        # Path Traversal fix
-                        ("canonicalpath", "CWE-22"),
-                        ("getcanonicalpath", "CWE-22"),
-                        ("normalize(", "CWE-22"),
-                        # OS Command Injection fix
-                        ("processbuilder", "CWE-78"),
-                        ("runtime.exec(new string[]", "CWE-78"),
-                        # SSRF fix
-                        ("allowedurls", "CWE-918"),
-                        ("whitelist", "CWE-918"), ("allowlist", "CWE-918"),
-                        # XSS fix
-                        ("escapehtml", "CWE-79"),
-                        ("htmlutils.htmlescape", "CWE-79"),
-                        ("stringescapeutils", "CWE-79"),
-                        # Hardcoded credentials
-                        ("system.getenv", "CWE-522"),
-                        ("system.getproperty", "CWE-522"),
-                        # URL Redirection fix
-                        ("isvalid", "CWE-601"), ("isallowed", "CWE-601"),
-                        # Cleartext fix
-                        ("ssl", "CWE-319"), ("tls", "CWE-319"), ("https", "CWE-319"),
+                        ("preparedstatement",    "CWE-89"),
+                        ("setstring(",            "CWE-89"),
+                        ("canonicalpath",         "CWE-22"),
+                        ("getcanonicalpath",      "CWE-22"),
+                        ("normalize(",            "CWE-22"),
+                        ("processbuilder",        "CWE-78"),
+                        ("allowedurls",           "CWE-918"),
+                        ("whitelist",             "CWE-918"),
+                        ("allowlist",             "CWE-918"),
+                        ("isvalidurl",            "CWE-918"),
+                        ("escapehtml",            "CWE-79"),
+                        ("stringescapeutils",     "CWE-79"),
+                        ("system.getenv",         "CWE-522"),
+                        ("system.getproperty",    "CWE-522"),
+                        ("isvalid",               "CWE-601"),
+                        ("isallowed",             "CWE-601"),
+                        ("https",                 "CWE-319"),
+                        ("ssl",                   "CWE-319"),
                     ]
 
                     vulnerability_found = False
@@ -371,31 +359,35 @@ def run_codebase_scan(
                         orig_tokens = set(original_code.lower().split())
                         result_tokens = set(result.lower().split())
 
-                        # Tokens present in output but not input = what the model added (the fix)
-                        added_tokens = result_tokens - orig_tokens
-                        added_text = " ".join(added_tokens)
-                        result_lower = result.lower()
-                        orig_lower = original_code.lower()
-
-                        # Compute simple change ratio (Jaccard distance between token sets)
                         union_size = len(orig_tokens | result_tokens)
                         intersection_size = len(orig_tokens & result_tokens)
-                        change_ratio = 1.0 - (intersection_size / union_size) if union_size > 0 else 0.0
+                        change_ratio = (
+                            1.0 - (intersection_size / union_size)
+                            if union_size > 0 else 0.0
+                        )
 
-                        # Only flag if the change is substantial (> 8% token difference)
-                        # AND a known security remediation pattern appears in the output
-                        # that was NOT already in the original code
-                        if change_ratio > 0.08:
+                        logger.debug(
+                            f"Fallback token change_ratio={change_ratio:.3f} for "
+                            f"{file_path.name} lines "
+                            f"{chunk['start_line']}-{chunk['end_line']}"
+                        )
+
+                        # Primary gate: model must have substantially rewritten the code
+                        if change_ratio > 0.15:
+                            vulnerability_found = True
+                            # Secondary: try to identify CWE from what the model added
+                            result_lower = result.lower()
+                            orig_lower = original_code.lower()
                             for pattern, cwe in REMEDIATION_SIGNALS:
                                 if pattern in result_lower and pattern not in orig_lower:
-                                    vulnerability_found = True
                                     detected_cwe_id = cwe
                                     break
 
                     if vulnerability_found:
                         cwe_id = detected_cwe_id or "Unknown"
-                        cwe_info = CWE_METADATA.get(cwe_id, {"name": "Unknown", "severity": "Unknown"})
-
+                        cwe_info = CWE_METADATA.get(
+                            cwe_id, {"name": "Unknown", "severity": "Unknown"}
+                        )
                         findings.append({
                             "file_path": str(file_path.relative_to(target_path.parent)),
                             "start_line": chunk["start_line"],
@@ -405,16 +397,17 @@ def run_codebase_scan(
                             "severity": cwe_info["severity"],
                             "confidence": 0.55,
                             "description": (
-                                f"Fallback heuristic: model produced a security remediation "
-                                f"(detected fix pattern for {cwe_id})."
+                                f"Fallback heuristic: model rewrote "
+                                f"{change_ratio:.0%} of tokens "
+                                f"(fix pattern detected: {cwe_id})."
                             ),
                             "original_code": original_code
                         })
                     else:
                         logger.debug(
-                            f"Fallback heuristic: output is identical or lacks security "
-                            f"remediation pattern for {file_path.name} "
-                            f"lines {chunk['start_line']}-{chunk['end_line']}. Skipping."
+                            f"Fallback heuristic: change ratio too low for "
+                            f"{file_path.name} lines "
+                            f"{chunk['start_line']}-{chunk['end_line']}. Skipping."
                         )
 
         except Exception as file_err:
