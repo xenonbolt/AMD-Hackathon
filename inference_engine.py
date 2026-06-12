@@ -15,14 +15,8 @@ logging.basicConfig(
 logger = logging.getLogger("inference_engine")
 
 PROMPT_TEMPLATE = (
-    "### Instruction: Analyze the following Java code for security vulnerabilities. "
-    "If a vulnerability exists, respond with a JSON object in this exact format:\n"
-    '{{"vulnerabilities": [{{"cwe_id": "CWE-XXX", "cwe_name": "...", '
-    '"severity": "critical|high|medium|low", "confidence": 0.0-1.0, '
-    '"description": "...", "location": {{"start_line": 1, "end_line": 1}}}}]}}\n'
-    "If no vulnerability exists, respond with: "
-    '{{"vulnerabilities": []}}\n'
-    "Respond with JSON only. No explanation outside the JSON.\n\n"
+    "### Instruction: Analyze the following Java code for vulnerabilities. "
+    "If a vulnerability exists, identify it and provide the remediated code.\n\n"
     "### Input:\n{vuln_code}\n\n"
     "### Response:\n"
 )

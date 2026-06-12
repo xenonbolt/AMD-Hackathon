@@ -319,45 +319,81 @@ def run_codebase_scan(
                                 "original_code": original_code
                             })
                 else:
-                    # Fallback heuristic: require the model output to contain EXPLICIT
-                    # vulnerability language before flagging. The old check (output != input)
-                    # was too loose — the model always generates some text, so everything
-                    # was flagged. Now we require at least one positive vulnerability signal.
-                    POSITIVE_VULN_KEYWORDS = [
-                        "vulnerab", "exploit", "injection", "cwe-", "cwe ",
-                        "overflow", "traversal", "forgery", "xss", "ssrf",
-                        "hardcoded", "hard-coded", "cleartext", "unencrypted",
-                        "command injection", "sql inject", "ldap inject",
-                        "path inject", "open redirect", "insecure",
-                        "attacker", "malicious", "arbitrary code"
-                    ]
-                    NEGATIVE_PHRASES = [
-                        "no vulnerability", "not vulnerable", "no vulnerabilities",
-                        "secure", "safe code", "no issues", "no security",
-                        "false positive", "benign", "no exploit"
+                    # -------------------------------------------------------
+                    # Fallback heuristic — the model outputs REMEDIATED CODE,
+                    # not JSON or text descriptions (it was trained on vuln→fix
+                    # pairs). A vulnerability is present when the model produces
+                    # meaningfully different code that introduces a security fix.
+                    #
+                    # Strategy:
+                    #   1. Compute a normalised token-level diff ratio.
+                    #   2. Require a minimum meaningful change (not just whitespace).
+                    #   3. Confirm the change is security-relevant by checking
+                    #      whether known remediation patterns appear in the output
+                    #      but NOT in the input (i.e., the model actually added them).
+                    #   4. Short/trivial snippets (constructors, DTOs, stubs) produce
+                    #      identical output → ratio ~0 → correctly skipped.
+                    # -------------------------------------------------------
+
+                    # Security remediation patterns: things the model ADDS when fixing
+                    REMEDIATION_SIGNALS = [
+                        # SQL Injection fix
+                        ("preparedstatement", "CWE-89"),
+                        ("setstring(", "CWE-89"), ("setint(", "CWE-89"),
+                        ("setlong(", "CWE-89"), ("setobject(", "CWE-89"),
+                        # Path Traversal fix
+                        ("canonicalpath", "CWE-22"),
+                        ("getcanonicalpath", "CWE-22"),
+                        ("normalize(", "CWE-22"),
+                        # OS Command Injection fix
+                        ("processbuilder", "CWE-78"),
+                        ("runtime.exec(new string[]", "CWE-78"),
+                        # SSRF fix
+                        ("allowedurls", "CWE-918"),
+                        ("whitelist", "CWE-918"), ("allowlist", "CWE-918"),
+                        # XSS fix
+                        ("escapehtml", "CWE-79"),
+                        ("htmlutils.htmlescape", "CWE-79"),
+                        ("stringescapeutils", "CWE-79"),
+                        # Hardcoded credentials
+                        ("system.getenv", "CWE-522"),
+                        ("system.getproperty", "CWE-522"),
+                        # URL Redirection fix
+                        ("isvalid", "CWE-601"), ("isallowed", "CWE-601"),
+                        # Cleartext fix
+                        ("ssl", "CWE-319"), ("tls", "CWE-319"), ("https", "CWE-319"),
                     ]
 
                     vulnerability_found = False
-                    if result:
-                        lower_res = result.lower()
-                        has_positive = any(kw in lower_res for kw in POSITIVE_VULN_KEYWORDS)
-                        has_negative = any(ph in lower_res for ph in NEGATIVE_PHRASES)
-                        if has_positive and not has_negative:
-                            vulnerability_found = True
+                    detected_cwe_id = None
 
-                    if vulnerability_found:
-                        cwe_match = re.search(r'(CWE-\d+)', result, re.IGNORECASE)
-                        cwe_id = cwe_match.group(1).upper() if cwe_match else None
+                    if result and result.strip():
+                        orig_tokens = set(original_code.lower().split())
+                        result_tokens = set(result.lower().split())
 
-                        if not cwe_id:
-                            # Try keyword matching against the unstructured text
-                            lower_result = result.lower()
-                            for mapped_cwe, mapped_info in CWE_METADATA.items():
-                                if any(kw in lower_result for kw in mapped_info.get("keywords", [])):
-                                    cwe_id = mapped_cwe
+                        # Tokens present in output but not input = what the model added (the fix)
+                        added_tokens = result_tokens - orig_tokens
+                        added_text = " ".join(added_tokens)
+                        result_lower = result.lower()
+                        orig_lower = original_code.lower()
+
+                        # Compute simple change ratio (Jaccard distance between token sets)
+                        union_size = len(orig_tokens | result_tokens)
+                        intersection_size = len(orig_tokens & result_tokens)
+                        change_ratio = 1.0 - (intersection_size / union_size) if union_size > 0 else 0.0
+
+                        # Only flag if the change is substantial (> 8% token difference)
+                        # AND a known security remediation pattern appears in the output
+                        # that was NOT already in the original code
+                        if change_ratio > 0.08:
+                            for pattern, cwe in REMEDIATION_SIGNALS:
+                                if pattern in result_lower and pattern not in orig_lower:
+                                    vulnerability_found = True
+                                    detected_cwe_id = cwe
                                     break
 
-                        cwe_id = cwe_id or "Unknown"
+                    if vulnerability_found:
+                        cwe_id = detected_cwe_id or "Unknown"
                         cwe_info = CWE_METADATA.get(cwe_id, {"name": "Unknown", "severity": "Unknown"})
 
                         findings.append({
@@ -367,15 +403,18 @@ def run_codebase_scan(
                             "cwe_id": cwe_id,
                             "cwe_name": cwe_info["name"],
                             "severity": cwe_info["severity"],
-                            "confidence": 0.5,
-                            "description": "Vulnerability identified by fallback heuristic.",
+                            "confidence": 0.55,
+                            "description": (
+                                f"Fallback heuristic: model produced a security remediation "
+                                f"(detected fix pattern for {cwe_id})."
+                            ),
                             "original_code": original_code
                         })
                     else:
                         logger.debug(
-                            f"Fallback heuristic: no positive vulnerability signal in model "
-                            f"output for {file_path.name} lines "
-                            f"{chunk['start_line']}-{chunk['end_line']}. Skipping."
+                            f"Fallback heuristic: output is identical or lacks security "
+                            f"remediation pattern for {file_path.name} "
+                            f"lines {chunk['start_line']}-{chunk['end_line']}. Skipping."
                         )
 
         except Exception as file_err:
@@ -473,14 +512,22 @@ def run_codebase_scan(
     # Save structured output report
     report_path = Path(output_report)
     try:
+        # Strip internal-only fields before writing — original_code is used by the
+        # verifier but should not appear in the final report output.
+        def _strip_internal(findings_list):
+            return [
+                {k: v for k, v in f.items() if k != "original_code"}
+                for f in findings_list
+            ]
+
         report_data = {
             "target_directory": str(target_path.resolve()),
             "total_files_scanned": len(java_files),
             "total_suspected_before_verification": total_before_verification,
             "vulnerabilities_count": len(verified_findings),
             "false_positives_discarded": len(false_positives),
-            "findings": verified_findings,
-            "false_positives": false_positives
+            "findings": _strip_internal(verified_findings),
+            "false_positives": _strip_internal(false_positives)
         }
         with open(report_path, "w", encoding="utf-8") as rf:
             json.dump(report_data, rf, indent=4)
