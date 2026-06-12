@@ -123,7 +123,8 @@ class VulnerabilityInferenceEngine:
             max_new_tokens: Maximum number of response tokens to generate.
 
         Returns:
-            Extracted remediation text / output from the model.
+            Extracted remediation / analysis text from the model, or an empty
+            string if the model output is detected as hallucinated garbage.
         """
         try:
             # Construct exact prompt template matching training
@@ -138,7 +139,8 @@ class VulnerabilityInferenceEngine:
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
-                    do_sample=False,  # Deterministic (greedy) decoding
+                    do_sample=False,          # Deterministic (greedy) decoding
+                    repetition_penalty=1.15,  # Prevents {!!!!!} repetition loops
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
@@ -147,17 +149,39 @@ class VulnerabilityInferenceEngine:
             decoded_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
             # Isolate the response segment from prompt text
-            # In cases where model generated EOS or standard formatting, slice after response header
             response_marker = "### Response:\n"
             marker_idx = decoded_output.find(response_marker)
             if marker_idx != -1:
-                response = decoded_output[marker_idx + len(response_marker):].strip()
+                response = decoded_output[marker_idx + len(response_marker):]
             else:
-                # Fallback: slice using length of constructed prompt if marker not found cleanly
-                # (Skipping special characters or potential formatting variations)
+                # Fallback: slice past the prompt tokens
                 clean_prompt = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                response = decoded_output[len(clean_prompt):].strip()
-                
+                response = decoded_output[len(clean_prompt):]
+
+            # Truncate at the next section marker to prevent the model bleeding
+            # into a hallucinated follow-up prompt (e.g. "### Instruction: ...")
+            for stop_marker in ["### Instruction:", "### Input:", "### Response:"]:
+                stop_idx = response.find(stop_marker)
+                if stop_idx != -1:
+                    response = response[:stop_idx]
+
+            response = response.strip()
+
+            # Garbage-output guard: if any single non-alphanumeric character
+            # (e.g. '!') dominates > 15% of the response, the model has
+            # hallucinated repetitive noise — return empty so callers skip it.
+            if response:
+                total_chars = len(response)
+                for ch in set(response):
+                    if not ch.isalnum() and ch not in (' ', '\n', '\t', '\r'):
+                        if response.count(ch) / total_chars > 0.15:
+                            logger.warning(
+                                f"analyze_snippet: garbage output detected "
+                                f"(char '{ch}' dominates {response.count(ch)/total_chars:.0%}). "
+                                f"Returning empty response."
+                            )
+                            return ""
+
             return response
             
         except Exception as e:
@@ -213,7 +237,8 @@ class VulnerabilityInferenceEngine:
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
-                    do_sample=False,  # Deterministic (greedy) decoding
+                    do_sample=False,          # Deterministic (greedy) decoding
+                    repetition_penalty=1.15,  # Prevents repetition loops
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )

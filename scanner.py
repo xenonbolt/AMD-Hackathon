@@ -356,32 +356,88 @@ def run_codebase_scan(
                     detected_cwe_id = None
 
                     if result and result.strip():
-                        orig_tokens = set(original_code.lower().split())
-                        result_tokens = set(result.lower().split())
+                        # -------------------------------------------------
+                        # Garbage / hallucination filter
+                        # The model sometimes outputs {!!!!!!} or similar
+                        # repetitive noise instead of code. Detect and skip.
+                        #
+                        # Check 1 — character repetition:
+                        #   If any single non-alphanumeric char (e.g. '!')
+                        #   makes up > 15% of the total output, it's noise.
+                        # Check 2 — Java keyword presence:
+                        #   Real remediated code contains structural Java
+                        #   keywords. Require at least 2 to be present.
+                        # -------------------------------------------------
+                        JAVA_KEYWORDS = {
+                            "public", "private", "protected", "void", "return",
+                            "try", "catch", "throw", "throws", "new", "if",
+                            "else", "for", "while", "class", "interface",
+                            "import", "static", "final", "string", "int",
+                            "boolean", "object", "null", "true", "false",
+                            "this", "super", "instanceof", "extends", "implements"
+                        }
 
-                        union_size = len(orig_tokens | result_tokens)
-                        intersection_size = len(orig_tokens & result_tokens)
-                        change_ratio = (
-                            1.0 - (intersection_size / union_size)
-                            if union_size > 0 else 0.0
-                        )
+                        result_stripped = result.strip()
+                        total_chars = max(len(result_stripped), 1)
 
-                        logger.debug(
-                            f"Fallback token change_ratio={change_ratio:.3f} for "
-                            f"{file_path.name} lines "
-                            f"{chunk['start_line']}-{chunk['end_line']}"
-                        )
-
-                        # Primary gate: model must have substantially rewritten the code
-                        if change_ratio > 0.15:
-                            vulnerability_found = True
-                            # Secondary: try to identify CWE from what the model added
-                            result_lower = result.lower()
-                            orig_lower = original_code.lower()
-                            for pattern, cwe in REMEDIATION_SIGNALS:
-                                if pattern in result_lower and pattern not in orig_lower:
-                                    detected_cwe_id = cwe
+                        # Check 1: single-character dominance (hallucination)
+                        is_garbage = False
+                        for ch in set(result_stripped):
+                            if not ch.isalnum() and ch not in (' ', '\n', '\t'):
+                                freq = result_stripped.count(ch) / total_chars
+                                if freq > 0.15:
+                                    is_garbage = True
+                                    logger.info(
+                                        f"Fallback: garbage output detected "
+                                        f"(char '{ch}' = {freq:.0%}) for "
+                                        f"{file_path.name} lines "
+                                        f"{chunk['start_line']}-{chunk['end_line']}. "
+                                        f"Skipping."
+                                    )
                                     break
+
+                        if is_garbage:
+                            pass  # skip to else branch below
+                        else:
+                            # Check 2: Java keyword presence
+                            result_words = set(result_stripped.lower().split())
+                            java_kw_count = len(result_words & JAVA_KEYWORDS)
+                            if java_kw_count < 2:
+                                logger.debug(
+                                    f"Fallback: output lacks Java keywords "
+                                    f"(found {java_kw_count}) for "
+                                    f"{file_path.name} lines "
+                                    f"{chunk['start_line']}-{chunk['end_line']}. "
+                                    f"Skipping."
+                                )
+                            else:
+                                orig_tokens = set(original_code.lower().split())
+                                result_tokens = set(result_stripped.lower().split())
+
+                                union_size = len(orig_tokens | result_tokens)
+                                intersection_size = len(orig_tokens & result_tokens)
+                                change_ratio = (
+                                    1.0 - (intersection_size / union_size)
+                                    if union_size > 0 else 0.0
+                                )
+
+                                logger.debug(
+                                    f"Fallback token change_ratio={change_ratio:.3f} "
+                                    f"java_kw={java_kw_count} for "
+                                    f"{file_path.name} lines "
+                                    f"{chunk['start_line']}-{chunk['end_line']}"
+                                )
+
+                                # Primary gate: model substantially rewrote the code
+                                if change_ratio > 0.15:
+                                    vulnerability_found = True
+                                    # Try to identify CWE from what the model added
+                                    result_lower = result_stripped.lower()
+                                    orig_lower = original_code.lower()
+                                    for pattern, cwe in REMEDIATION_SIGNALS:
+                                        if pattern in result_lower and pattern not in orig_lower:
+                                            detected_cwe_id = cwe
+                                            break
 
                     if vulnerability_found:
                         cwe_id = detected_cwe_id or "Unknown"
@@ -405,7 +461,7 @@ def run_codebase_scan(
                         })
                     else:
                         logger.debug(
-                            f"Fallback heuristic: change ratio too low for "
+                            f"Fallback heuristic: no valid remediation output for "
                             f"{file_path.name} lines "
                             f"{chunk['start_line']}-{chunk['end_line']}. Skipping."
                         )
