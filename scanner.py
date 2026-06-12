@@ -294,31 +294,30 @@ def run_codebase_scan(
                             f"(Lines {chunk['start_line']}-{chunk['end_line']})"
                         )
                         for vuln in vulnerabilities:
-                        # Extract location info relative to chunk start
-                        loc = vuln.get("location", {})
-                        # Location lines are 1-based relative to block. Absolute lines:
-                        # Handle missing or invalid location details gracefully
-                        try:
-                            start_offset = int(loc.get("start_line", 1)) - 1
-                            end_offset = int(loc.get("end_line", 1)) - 1
-                        except (ValueError, TypeError):
-                            start_offset = 0
-                            end_offset = chunk["end_line"] - chunk["start_line"]
-                            
-                        vuln_start = chunk["start_line"] + start_offset
-                        vuln_end = chunk["start_line"] + end_offset
+                            # Extract location info relative to chunk start
+                            loc = vuln.get("location", {})
+                            # Handle missing or invalid location details gracefully
+                            try:
+                                start_offset = int(loc.get("start_line", 1)) - 1
+                                end_offset = int(loc.get("end_line", 1)) - 1
+                            except (ValueError, TypeError):
+                                start_offset = 0
+                                end_offset = chunk["end_line"] - chunk["start_line"]
 
-                        findings.append({
-                            "file_path": str(file_path.relative_to(target_path.parent)),
-                            "start_line": vuln_start,
-                            "end_line": vuln_end,
-                            "cwe_id": vuln.get("cwe_id", ""),
-                            "cwe_name": vuln.get("cwe_name", ""),
-                            "severity": vuln.get("severity", ""),
-                            "confidence": vuln.get("confidence", 1.0),
-                            "description": vuln.get("description", ""),
-                            "original_code": original_code
-                        })
+                            vuln_start = chunk["start_line"] + start_offset
+                            vuln_end = chunk["start_line"] + end_offset
+
+                            findings.append({
+                                "file_path": str(file_path.relative_to(target_path.parent)),
+                                "start_line": vuln_start,
+                                "end_line": vuln_end,
+                                "cwe_id": vuln.get("cwe_id", ""),
+                                "cwe_name": vuln.get("cwe_name", ""),
+                                "severity": vuln.get("severity", ""),
+                                "confidence": vuln.get("confidence", 1.0),
+                                "description": vuln.get("description", ""),
+                                "original_code": original_code
+                            })
                 else:
                     # Fallback heuristic: check if output suggests any vulnerability keywords
                     # or is not just code matching original or indicating "no vulnerability"
@@ -361,14 +360,106 @@ def run_codebase_scan(
         except Exception as file_err:
             logger.error(f"Failed to scan file {file_path}: {file_err}", exc_info=True)
 
+    # -------------------------------------------------------------------------
+    # Pass 2: Verify each suspected finding to eliminate false positives
+    # and enrich confirmed findings with CWE metadata.
+    # -------------------------------------------------------------------------
+    total_before_verification = len(findings)
+    logger.info(
+        f"Starting second-pass verification on {total_before_verification} suspected finding(s)..."
+    )
+
+    verified_findings: List[Dict[str, Any]] = []
+    false_positives: List[Dict[str, Any]] = []
+
+    for finding_idx, finding in enumerate(findings):
+        logger.info(
+            f"[Verifier {finding_idx + 1}/{total_before_verification}] "
+            f"Verifying: {finding['file_path']} "
+            f"Lines {finding['start_line']}-{finding['end_line']}"
+        )
+        try:
+            verification = engine.verify_finding(
+                code=finding["original_code"],
+                initial_description=finding.get("description", "")
+            )
+        except Exception as verify_err:
+            logger.error(f"Verifier call failed for finding {finding_idx + 1}: {verify_err}")
+            # Conservative: keep the finding on verifier error
+            verification = {
+                "is_vulnerable": True,
+                "cwe_id": None,
+                "cwe_name": None,
+                "severity": None,
+                "confidence": 0.4,
+                "reason": "Verifier call failed; finding preserved conservatively."
+            }
+
+        if verification["is_vulnerable"]:
+            # --- True positive: enrich with verified CWE metadata ---
+            # Prefer verifier-supplied values; fall back to first-pass values if absent.
+            verified_cwe_id = verification["cwe_id"] or finding.get("cwe_id") or "Unknown"
+            verified_cwe_name = verification["cwe_name"] or finding.get("cwe_name") or ""
+            verified_severity = verification["severity"] or finding.get("severity") or ""
+
+            # If cwe_id still unknown, attempt CWE_METADATA lookup by keyword in reason/description
+            if verified_cwe_id == "Unknown" or not verified_cwe_name:
+                combined_text = (
+                    (verification.get("reason") or "") + " " +
+                    (verified_cwe_name or "") + " " +
+                    (finding.get("description") or "")
+                ).lower()
+                for mapped_cwe, mapped_info in CWE_METADATA.items():
+                    if any(kw in combined_text for kw in mapped_info.get("keywords", [])):
+                        if verified_cwe_id == "Unknown":
+                            verified_cwe_id = mapped_cwe
+                        if not verified_cwe_name:
+                            verified_cwe_name = mapped_info["name"]
+                        if not verified_severity:
+                            verified_severity = mapped_info["severity"]
+                        break
+
+            enriched = dict(finding)
+            enriched.update({
+                "cwe_id": verified_cwe_id,
+                "cwe_name": verified_cwe_name,
+                "severity": verified_severity,
+                "confidence": verification["confidence"],
+                "verifier_reason": verification["reason"],
+            })
+            verified_findings.append(enriched)
+            logger.warning(
+                f"  \u2714 CONFIRMED TRUE POSITIVE \u2014 "
+                f"{verified_cwe_id} ({verified_severity}) in "
+                f"{finding['file_path']}:{finding['start_line']}"
+            )
+        else:
+            # --- False positive: move to separate bucket for auditability ---
+            fp_entry = dict(finding)
+            fp_entry["verifier_reason"] = verification["reason"]
+            false_positives.append(fp_entry)
+            logger.info(
+                f"  \u2718 FALSE POSITIVE discarded \u2014 "
+                f"{finding['file_path']}:{finding['start_line']} "
+                f"Reason: {verification['reason']}"
+            )
+
+    logger.info(
+        f"Verification complete: {len(verified_findings)} true positive(s), "
+        f"{len(false_positives)} false positive(s) discarded."
+    )
+
     # Save structured output report
     report_path = Path(output_report)
     try:
         report_data = {
             "target_directory": str(target_path.resolve()),
             "total_files_scanned": len(java_files),
-            "vulnerabilities_count": len(findings),
-            "findings": findings
+            "total_suspected_before_verification": total_before_verification,
+            "vulnerabilities_count": len(verified_findings),
+            "false_positives_discarded": len(false_positives),
+            "findings": verified_findings,
+            "false_positives": false_positives
         }
         with open(report_path, "w", encoding="utf-8") as rf:
             json.dump(report_data, rf, indent=4)
