@@ -1,3 +1,7 @@
+import platform
+# Monkeypatch platform.win32_ver to bypass Windows WMI query errors/hangs
+platform.win32_ver = lambda release='', version='', csd='', ptype='': ('10', '10.0.22621', '', 'Multiprocessor Free')
+
 import argparse
 import logging
 import os
@@ -101,15 +105,23 @@ def run_training(
 
         # 2. Load Model & Tokenizer
         logger.info(f"Loading base model: {model_id}")
+        torch_dtype = compute_dtype if torch.cuda.is_available() else torch.float32
+        logger.info(f"Selected model loading precision dtype: {torch_dtype}")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             quantization_config=bnb_config,
             device_map=device_map,
+            torch_dtype=torch_dtype,
             trust_remote_code=True
         )
 
         logger.info(f"Loading tokenizer: {model_id}")
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        if "deepseek" in model_id.lower():
+            logger.info("DeepSeek model detected. Loading tokenizer via PreTrainedTokenizerFast to avoid LlamaTokenizer space bug.")
+            from transformers import PreTrainedTokenizerFast
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(model_id, trust_remote_code=True)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         if tokenizer.pad_token_id is None:
             logger.info("Setting missing pad_token to eos_token in tokenizer.")
             tokenizer.pad_token = tokenizer.eos_token
@@ -120,6 +132,9 @@ def run_training(
         if torch.cuda.is_available():
             logger.info("Preparing model for k-bit training...")
             model = prepare_model_for_kbit_training(model)
+        else:
+            logger.info("Enabling input gradients for CPU gradient checkpointing...")
+            model.enable_input_require_grads()
 
         # 4. Detect target modules for LoRA
         target_modules = find_all_linear_names(model)
@@ -172,6 +187,7 @@ def run_training(
             fp16=(is_cuda and compute_dtype == torch.float16),
             optim="paged_adamw_8bit" if is_cuda else "adamw_torch",
             ddp_find_unused_parameters=False,
+            gradient_checkpointing=True,
             report_to="none"
         )
 

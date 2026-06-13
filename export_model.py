@@ -1,3 +1,7 @@
+import platform
+# Monkeypatch platform.win32_ver to bypass Windows WMI query errors/hangs
+platform.win32_ver = lambda release='', version='', csd='', ptype='': ('10', '10.0.22621', '', 'Multiprocessor Free')
+
 import argparse
 import logging
 import os
@@ -60,3 +64,5 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     export_and_merge(args.model_id, args.adapter_path, args.output_dir)
+
+

@@ -1,3 +1,7 @@
+import platform
+# Monkeypatch platform.win32_ver to bypass Windows WMI query errors/hangs
+platform.win32_ver = lambda release='', version='', csd='', ptype='': ('10', '10.0.22621', '', 'Multiprocessor Free')
+
 import json
 import logging
 from pathlib import Path
@@ -62,6 +66,9 @@ class JavaVulnerabilityDataset(Dataset):
                         data: Dict[str, Any] = json.loads(line)
                         if "text" in data:
                             self.examples.append(data["text"])
+                        elif "instruction" in data and "input" in data and "output" in data:
+                            text = f"<|instruction|>\n{data['instruction']}\n\n<|input|>\n{data['input']}\n\n<|response|>\n{data['output']}"
+                            self.examples.append(text)
                         else:
                             logger.warning(
                                 f"Skipping line {line_idx} in {jsonl_path.name}: 'text' key not found."

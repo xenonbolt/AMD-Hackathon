@@ -63,12 +63,13 @@ A static analysis tool that recursively walks directories to locate `.java` file
 
 ## Usage Guide
 
-### 1. Fine-Tune the Model
+### 1. Fine-Tune the Modelclear
+
 To initiate 4-bit quantized training using PEFT LoRA adapters:
 ```bash
 python fine_tune.py \
-    --model_id "bigcode/starcoder2-3b" \
-    --dataset_path "vuln_dataset.jsonl" \
+    --model_id "deepseek-ai/deepseek-coder-6.7b-base" \
+    --dataset_path "Dataset/train_classifier_precise_lines.jsonl" \
     --output_dir "./adapters" \
     --epochs 3 \
     --batch_size 4
@@ -80,23 +81,29 @@ python export_model.py \
     --output_dir "./merged_offline_model"
 
 
-### 2. Run Single Code Snippet Inference
-To test the analysis of a specific code snippet with base + adapter model:
+### 2. Run Single File or Project Inference
+To analyze a specific Java file with base + adapter model:
 ```bash
 python inference_engine.py \
     --model_id "bigcode/starcoder2-3b" \
     --adapter_path "./adapters" \
-    --snippet_path "path/to/Snippet.java"
+    --target_path "path/to/Snippet.java"
 ```
-python inference_engine.py \
-    --model_id "./merged_offline_model" \
-    --snippet_path "path/to/Snippet.java"
 
+Using a merged offline model:
+```bash
 python inference_engine.py \
     --model_id "./merged_offline_model" \
-    --snippet_path "path/to/Snippet.java" \
+    --target_path "path/to/Snippet.java"
+```
+
+To scan an **entire Java project directory** (recursively finds all `.java` files):
+```bash
+python inference_engine.py \
+    --model_id "./merged_offline_model" \
+    --target_path "path/to/java/project" \
     --format json
-
+```
 
 ### 3. Scan a Codebase
 To recursively scan a directory containing Java source files:
