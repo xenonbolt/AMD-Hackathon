@@ -89,7 +89,11 @@ class JavaVulnerabilityDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Retrieves a single sample, tokenizes it, manages sequence lengths,
-        and sets labels matching the input IDs for Causal LM training.
+        and sets labels for Causal LM training with prompt masking.
+
+        Only the response portion (after <|response|>) contributes to the
+        training loss. The instruction and input tokens have their labels
+        set to -100 so CrossEntropyLoss ignores them.
         """
         text = self.examples[idx]
         try:
@@ -106,10 +110,32 @@ class JavaVulnerabilityDataset(Dataset):
             input_ids: List[int] = encodings["input_ids"]
             attention_mask: List[int] = encodings["attention_mask"]
 
-            # Causal LM training: labels are aligned with input_ids.
-            # PyTorch's CrossEntropyLoss ignores targets with value -100.
-            # Pad tokens will be masked in the collator.
+            # Create labels aligned with input_ids
             labels: List[int] = list(input_ids)
+
+            # --- Prompt Masking ---
+            # Find where the response section starts in the raw text.
+            # Everything before (and including) the <|response|>\n marker is prompt;
+            # the model should NOT be trained to predict those tokens.
+            response_marker = "<|response|>\n"
+            response_start_char = text.find(response_marker)
+
+            if response_start_char != -1:
+                # The prompt is everything up to and including the marker
+                prompt_text = text[:response_start_char + len(response_marker)]
+
+                # Tokenize just the prompt portion to find its token boundary
+                prompt_encodings = self.tokenizer(
+                    prompt_text,
+                    add_special_tokens=True,
+                    return_tensors=None
+                )
+                prompt_token_len = len(prompt_encodings["input_ids"])
+
+                # Mask all prompt tokens in labels (set to -100 so loss ignores them)
+                mask_len = min(prompt_token_len, len(labels))
+                for i in range(mask_len):
+                    labels[i] = -100
 
             return {
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),

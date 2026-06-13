@@ -196,7 +196,8 @@ class VulnerabilityInferenceEngine:
                 # 3b. Sanitize any residual repetition patterns in the output
                 generated_response = self._sanitize_repetition(generated_response)
 
-                # 4. Safely parse response
+                # 3c. Debug: log the raw model output before JSON parsing
+                logger.info(f"[{log_ctx}] Attempt {attempt_idx} raw output ({len(generated_response)} chars): {generated_response[:500]}")
                 result = self._parse_json_safely(generated_response)
 
                 # 5. If parsing failed and we have more attempts, retry
@@ -227,21 +228,35 @@ class VulnerabilityInferenceEngine:
         Detects and truncates degenerate repetition patterns in model output.
         For example: 'Exploitation of CWE-287 (Exploitation of CWE-287 (Exploitation of ...'
         will be truncated to just 'Exploitation of CWE-287'.
+
+        IMPORTANT: This is conservative — it only activates on 5+ consecutive
+        repeats and skips text that looks like valid JSON to avoid false positives
+        on structured vulnerability reports with similar-looking entries.
         """
-        if not text or len(text) < 40:
+        if not text or len(text) < 100:
             return text
 
-        # Strategy: find any substring of length 15-80 that repeats 3+ times consecutively
-        for pattern_len in range(15, min(81, len(text) // 3 + 1)):
-            for start in range(len(text) - pattern_len * 3 + 1):
+        # Skip sanitization entirely if the text looks like valid structured JSON
+        # (structured JSON with multiple vulnerability entries can trigger false positives)
+        stripped = text.strip()
+        if stripped.startswith('{') and ('"vulnerabilities"' in stripped or '"cwe_id"' in stripped):
+            return text
+
+        # Strategy: find any substring of length 20-80 that repeats 5+ times consecutively
+        # (raised from 3x to 5x to avoid false positives on structured output)
+        min_repeats = 5
+        for pattern_len in range(20, min(81, len(text) // min_repeats + 1)):
+            for start in range(len(text) - pattern_len * min_repeats + 1):
                 candidate = text[start:start + pattern_len]
-                # Check if it repeats at least 3 times consecutively
+                # Skip candidates that are mostly whitespace/structural JSON chars
+                if candidate.strip() in ('', '{', '}', '[', ']', ','):
+                    continue
                 repeat_count = 1
                 pos = start + pattern_len
                 while pos + pattern_len <= len(text) and text[pos:pos + pattern_len] == candidate:
                     repeat_count += 1
                     pos += pattern_len
-                if repeat_count >= 3:
+                if repeat_count >= min_repeats:
                     logger.warning(
                         f"Detected degenerate repetition ({repeat_count}x): '{candidate[:50]}...'. Truncating."
                     )
@@ -393,7 +408,20 @@ class VulnerabilityInferenceEngine:
                 parsed_data = self._normalize_json_keys(parsed_data)
                 # Standardize returned output layout
                 if "vulnerabilities" not in parsed_data:
-                    parsed_data = {"vulnerabilities": [], "raw_output": parsed_data}
+                    # Check alternative keys the model might have used
+                    for alt_key in ("findings", "issues", "results", "vulnerability_list"):
+                        if alt_key in parsed_data and isinstance(parsed_data[alt_key], list):
+                            parsed_data["vulnerabilities"] = parsed_data.pop(alt_key)
+                            break
+                    else:
+                        # If the parsed data is itself a list, treat it as vulnerability entries
+                        if isinstance(parsed_data, list):
+                            parsed_data = {"vulnerabilities": parsed_data}
+                        # If the parsed data looks like a single vulnerability entry
+                        elif isinstance(parsed_data, dict) and ("cwe_id" in parsed_data or "severity" in parsed_data):
+                            parsed_data = {"vulnerabilities": [parsed_data]}
+                        else:
+                            parsed_data = {"vulnerabilities": [], "raw_output": parsed_data}
                 return parsed_data
             except json.JSONDecodeError as decode_err:
                 if attempt_label == "direct":
@@ -440,20 +468,35 @@ class VulnerabilityInferenceEngine:
         - Clamps hallucinated line numbers to actual file size
         - Cleans repetitive CWE names
         - Ensures required fields have sensible defaults
-        - Filters out empty/malformed entries
+        - Keeps entries even if cwe_id/cwe_name is missing (fills defaults)
         """
         if not isinstance(vulns, list):
             return []
 
         validated = []
+        dropped = 0
         for vuln in vulns:
             if not isinstance(vuln, dict):
+                dropped += 1
                 continue
 
-            # Must have at least a cwe_id or cwe_name to be considered valid
-            has_cwe = vuln.get("cwe_id") or vuln.get("cwe_name")
-            if not has_cwe:
+            # If the entry is completely empty (no keys at all), skip it
+            if not vuln:
+                dropped += 1
                 continue
+
+            # Fill in defaults for missing cwe fields instead of dropping the entry.
+            # The model may produce valid findings with slightly different key names.
+            if not vuln.get("cwe_id") and not vuln.get("cwe_name"):
+                # Try to infer from other keys the model might have used
+                for alt_key in ("type", "vulnerability", "name", "category", "vuln_type"):
+                    if alt_key in vuln:
+                        vuln["cwe_name"] = str(vuln[alt_key])
+                        break
+                else:
+                    # Still keep it — just label it unknown
+                    vuln.setdefault("cwe_name", "Unknown Vulnerability")
+                logger.debug(f"Vulnerability entry missing cwe_id/cwe_name, filled default: {vuln}")
 
             # Clean CWE name of repetitive patterns
             if "cwe_name" in vuln:
@@ -490,6 +533,10 @@ class VulnerabilityInferenceEngine:
                     vuln.pop("confidence", None)
 
             validated.append(vuln)
+
+        if dropped > 0:
+            logger.warning(f"Validation dropped {dropped} malformed entries, kept {len(validated)}")
+        logger.info(f"Validation: {len(vulns)} entries in → {len(validated)} entries out")
 
         return validated
 

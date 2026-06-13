@@ -63,29 +63,32 @@ A static analysis tool that recursively walks directories to locate `.java` file
 
 ## Usage Guide
 
-### 1. Fine-Tune the Modelclear
+### 1. Balance the Dataset (Recommended)
+The raw dataset may have too many negative (no-vulnerability) examples, causing the model to always predict empty results. Re-balance to ~20% negatives:
+```bash
+python balance_dataset.py \
+    --input "Dataset/train_classifier_precise_lines.jsonl" \
+    --output "Dataset/train_balanced.jsonl" \
+    --neg_ratio 0.20
+```
+
+### 2. Fine-Tune the Model
 
 To initiate 4-bit quantized training using PEFT LoRA adapters:
 ```bash
 python fine_tune.py \
     --model_id "deepseek-ai/deepseek-coder-6.7b-base" \
-    --dataset_path "Dataset/train_classifier_precise_lines.jsonl" \
+    --dataset_path "Dataset/train_balanced.jsonl" \
     --output_dir "./adapters" \
     --epochs 3 \
     --batch_size 4
 ```
 
-python export_model.py \
-    --model_id "bigcode/starcoder2-3b" \
-    --adapter_path "./adapters" \
-    --output_dir "./merged_offline_model"
-
-
-### 2. Run Single File or Project Inference
+### 3. Run Single File or Project Inference
 To analyze a specific Java file with base + adapter model:
 ```bash
 python inference_engine.py \
-    --model_id "bigcode/starcoder2-3b" \
+    --model_id "deepseek-ai/deepseek-coder-6.7b-base" \
     --adapter_path "./adapters" \
     --target_path "path/to/Snippet.java"
 ```
@@ -94,22 +97,15 @@ Using a merged offline model:
 ```bash
 python inference_engine.py \
     --model_id "./merged_offline_model" \
-    --target_path "path/to/Snippet.java"
-```
-
-To scan an **entire Java project directory** (recursively finds all `.java` files):
-```bash
-python inference_engine.py \
-    --model_id "./merged_offline_model" \
     --target_path "path/to/java/project" \
     --format json
 ```
 
-### 3. Scan a Codebase
+### 4. Scan a Codebase
 To recursively scan a directory containing Java source files:
 ```bash
 python scanner.py \
-    --model_id "bigcode/starcoder2-3b" \
+    --model_id "deepseek-ai/deepseek-coder-6.7b-base" \
     --adapter_path "./adapters" \
     --target_dir "path/to/java/project" \
     --output_report "vulnerability_report.json"
