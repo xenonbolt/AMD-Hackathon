@@ -1,0 +1,6 @@
+{
+  "name": "CodeElixir.AI",
+  "description": "CodeElixir.AI: A light colourful glassmorphic dashboard to scan, audit, and securely remediate Java vulnerabilities with the power of Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
