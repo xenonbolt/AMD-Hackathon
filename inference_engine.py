@@ -140,7 +140,9 @@ class VulnerabilityInferenceEngine:
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,          # Deterministic (greedy) decoding
-                    repetition_penalty=1.15,  # Prevents {!!!!!} repetition loops
+                    repetition_penalty=1.3,   # Soft penalty on repeated tokens
+                    no_repeat_ngram_size=3,   # Hard ban: no 3-token sequence can repeat
+                                              # (makes {!!!!...} impossible to generate)
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
@@ -238,7 +240,8 @@ class VulnerabilityInferenceEngine:
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,          # Deterministic (greedy) decoding
-                    repetition_penalty=1.15,  # Prevents repetition loops
+                    repetition_penalty=1.3,   # Soft penalty on repeated tokens
+                    no_repeat_ngram_size=3,   # Hard ban: no 3-token sequence can repeat
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
