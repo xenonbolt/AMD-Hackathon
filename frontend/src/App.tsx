@@ -1,0 +1,1143 @@
+import React, { useState, useRef, useEffect, useMemo } from "react";
+import { 
+  Shield, 
+  FileCode, 
+  FolderOpen, 
+  Cpu, 
+  AlertTriangle, 
+  CheckCircle2, 
+  XCircle, 
+  Flame, 
+  Eye, 
+  RefreshCw, 
+  Check, 
+  Trash2, 
+  HelpCircle, 
+  GitCommit, 
+  Terminal, 
+  ArrowRight, 
+  ChevronRight, 
+  Sparkles, 
+  Code2,
+  FileCheck,
+  AlertOctagon,
+  KeyRound,
+  FileSpreadsheet,
+  Info
+} from "lucide-react";
+import { motion, AnimatePresence } from "motion/react";
+import { JavaFile, Vulnerability } from "./types";
+import { DEMO_PROJECTS } from "./data/demoFiles";
+
+// Lightweight regex-based syntax tokenizer for Java code
+function tokenizeJavaLine(line: string): { text: string; type: string }[] {
+  if (!line) return [{ text: " ", type: "text" }];
+
+  const regex = /(\/\/.*)|("(\\.|[^"\\])*")|('(\\.|[^'\\])*')|(@[a-zA-Z0-9_]+)|(\b(?:public|private|protected|class|interface|enum|extends|implements|import|package|return|new|if|else|for|while|try|catch|finally|throw|throws|final|static|void|int|double|float|long|boolean|char|short|byte|null|true|false|this|super)\b)|(\b\d+(?:\.\d+)?\b)|(\b[A-Z][a-zA-Z0-9_]*\b)|(\b[a-z_][a-zA-Z0-9_]*(?=\s*\())|([+\-*/%&=<>!|~^:?(){}[\];.,]+)|(\s+)|([^\s]+)/g;
+
+  const tokens: { text: string; type: string }[] = [];
+  let match;
+  
+  while ((match = regex.exec(line)) !== null) {
+    const [
+      full,
+      comment,
+      stringDouble,
+      stringSingle,
+      annotation,
+      keyword,
+      number,
+      className,
+      methodName,
+      operator,
+      whitespace,
+      other
+    ] = match;
+
+    if (comment !== undefined) {
+      tokens.push({ text: comment, type: "comment" });
+    } else if (stringDouble !== undefined) {
+      tokens.push({ text: stringDouble, type: "string" });
+    } else if (stringSingle !== undefined) {
+      tokens.push({ text: stringSingle, type: "string" });
+    } else if (annotation !== undefined) {
+      tokens.push({ text: annotation, type: "annotation" });
+    } else if (keyword !== undefined) {
+      tokens.push({ text: keyword, type: "keyword" });
+    } else if (number !== undefined) {
+      tokens.push({ text: number, type: "number" });
+    } else if (className !== undefined) {
+      tokens.push({ text: className, type: "class-name" });
+    } else if (methodName !== undefined) {
+      tokens.push({ text: methodName, type: "method-name" });
+    } else if (operator !== undefined) {
+      tokens.push({ text: operator, type: "operator" });
+    } else if (whitespace !== undefined) {
+      tokens.push({ text: whitespace, type: "text" });
+    } else {
+      tokens.push({ text: other, type: "text" });
+    }
+  }
+
+  return tokens;
+}
+
+// Map Java syntax elements to classic VS Code Dark style coloring with soft green hints
+function renderHighlightedCode(line: string) {
+  const tokens = tokenizeJavaLine(line);
+  return (
+    <>
+      {tokens.map((token, i) => {
+        let styleClass = "";
+        switch (token.type) {
+          case "comment":
+            styleClass = "text-emerald-500/80 italic"; // VS Code green comments
+            break;
+          case "string":
+            styleClass = "text-amber-300"; // Rich VS Code amber/yellow strings
+            break;
+          case "annotation":
+            styleClass = "text-emerald-400 font-semibold"; // Green annotations
+            break;
+          case "keyword":
+            styleClass = "text-sky-450 font-bold"; // Deep blue keywords
+            break;
+          case "number":
+            styleClass = "text-emerald-400 font-semibold"; // Green numbers
+            break;
+          case "class-name":
+            styleClass = "text-teal-300 font-semibold"; // Teal classes
+            break;
+          case "method-name":
+            styleClass = "text-yellow-200"; // Warm yellow-gold methods
+            break;
+          case "operator":
+            styleClass = "text-slate-400"; // Operators
+            break;
+          default:
+            styleClass = "text-slate-200"; // Active default foreground text
+        }
+        return (
+          <span key={i} className={styleClass}>
+            {token.text}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
+export default function App() {
+  // Projects and files
+  const [selectedProjectIndex, setSelectedProjectIndex] = useState<number>(0);
+  const [loadedFiles, setLoadedFiles] = useState<JavaFile[]>(DEMO_PROJECTS[0].files);
+  const [activeFileIndex, setActiveFileIndex] = useState<number>(0);
+
+  // Security elements
+  const [vulnerabilities, setVulnerabilities] = useState<Vulnerability[]>([]);
+  const [scanState, setScanState] = useState<"idle" | "scanning" | "completed">("idle");
+  const [scanProgress, setScanProgress] = useState<number>(0);
+  const [scanProgressText, setScanProgressText] = useState<string>("");
+  const [scanMode, setScanMode] = useState<"local_heuristics" | "gemini_ai" | "none">("none");
+  const [scanMessage, setScanMessage] = useState<string>("");
+
+  // Specific remediation states (vulnerabilityId -> "idle" | "fixing" | "diff_ready" | "approved")
+  const [remediatingIdState, setRemediatingIdState] = useState<Record<string, "idle" | "fixing" | "diff_ready" | "approved">>({});
+
+  // Direct manual code pasting sandbox helper
+  const [sandboxCode, setSandboxCode] = useState<string>("");
+  const [sandboxFileName, setSandboxFileName] = useState<string>("MyVulnerableService.java");
+  const [isSandboxOpen, setIsSandboxOpen] = useState<boolean>(false);
+
+  // Drag and drop states
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
+  // Active highlighted lines in file editor (from selected vulnerability)
+  const [selectedVulnerabilityId, setSelectedVulnerabilityId] = useState<string | null>(null);
+  const activeFile = loadedFiles[activeFileIndex] || null;
+
+  // Initialize demo data on load so they see some initial items
+  useEffect(() => {
+    // Loaded files defaulted to Project 0
+    setLoadedFiles(DEMO_PROJECTS[selectedProjectIndex].files);
+    setActiveFileIndex(0);
+    setScanState("idle");
+    setVulnerabilities([]);
+    setSelectedVulnerabilityId(null);
+  }, [selectedProjectIndex]);
+
+  // Quick preset loading
+  const handleSelectProject = (idx: number) => {
+    setSelectedProjectIndex(idx);
+  };
+
+  // Drag-and-drop overrides
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+
+    if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+      processFileList(e.dataTransfer.files);
+    }
+  };
+
+  // Process standard HTML File list (either single or multi uploads)
+  const processFileList = async (files: FileList) => {
+    const javaFilesList: JavaFile[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (file.name.endsWith(".java") || file.type === "text/x-java-source") {
+        const textContent = await readFileContent(file);
+        javaFilesList.push({
+          name: file.name,
+          path: file.webkitRelativePath || `uploads/${file.name}`,
+          content: textContent,
+          originalContent: textContent
+        });
+      }
+    }
+
+    if (javaFilesList.length > 0) {
+      setLoadedFiles(javaFilesList);
+      setActiveFileIndex(0);
+      setScanState("idle");
+      setVulnerabilities([]);
+      setSelectedVulnerabilityId(null);
+    } else {
+      alert("No Java source files (.java) detected in the uploaded list.");
+    }
+  };
+
+  const readFileContent = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target?.result as string || "");
+      reader.onerror = (e) => reject(e);
+      reader.readAsText(file);
+    });
+  };
+
+  // Handle standard individual file selection
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      processFileList(e.target.files);
+    }
+  };
+
+  // Add a fully custom pasted Java code file inside workspace
+  const handleAddSandboxFile = () => {
+    if (!sandboxCode.trim()) return;
+    
+    const newFile: JavaFile = {
+      name: sandboxFileName.endsWith(".java") ? sandboxFileName : `${sandboxFileName}.java`,
+      path: `sandbox/${sandboxFileName.endsWith(".java") ? sandboxFileName : `${sandboxFileName}.java`}`,
+      content: sandboxCode,
+      originalContent: sandboxCode
+    };
+
+    setLoadedFiles([newFile, ...loadedFiles]);
+    setActiveFileIndex(0);
+    setSandboxCode("");
+    setIsSandboxOpen(false);
+    setScanState("idle");
+    setVulnerabilities([]);
+    setSelectedVulnerabilityId(null);
+  };
+
+  // Perform full Code Security Scan
+  const triggerCodeScan = async () => {
+    if (loadedFiles.length === 0) return;
+
+    setScanState("scanning");
+    setScanProgress(5);
+    setScanProgressText("Initializing security context...");
+
+    // Dramatic progress bar steps
+    const steps = [
+      { prg: 20, text: "Generating AST representation models..." },
+      { prg: 45, text: "Tracing data tainted parameters..." },
+      { prg: 70, text: "Cross-referencing OWASP rulesets..." },
+      { prg: 88, text: "Verifying cryptographic strength limits..." },
+      { prg: 95, text: "Assembling vulnerability matrix maps..." }
+    ];
+
+    let currentStep = 0;
+    const interval = setInterval(() => {
+      if (currentStep < steps.length) {
+        setScanProgress(steps[currentStep].prg);
+        setScanProgressText(steps[currentStep].text);
+        currentStep++;
+      }
+    }, 550);
+
+    try {
+      const response = await fetch("/api/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files: loadedFiles })
+      });
+
+      clearInterval(interval);
+      setScanProgress(100);
+      setScanProgressText("Audit compilation finalized!");
+
+      const data = await response.json();
+      
+      setTimeout(() => {
+        setVulnerabilities(data.vulnerabilities || []);
+        // Setup state map of vulnerabilities
+        const stateMap: Record<string, "idle" | "fixing" | "diff_ready" | "approved"> = {};
+        (data.vulnerabilities || []).forEach((v: Vulnerability) => {
+          stateMap[v.id] = v.remediatedSnippet ? "diff_ready" : "idle";
+        });
+        setRemediatingIdState(stateMap);
+
+        setScanMode(data.mode || "local_heuristics");
+        setScanMessage(data.message || "");
+        setScanState("completed");
+      }, 300);
+
+    } catch (err: any) {
+      clearInterval(interval);
+      console.error("Scan attempt failed completely:", err);
+      setScanProgressText("API Interface failed. Starting local scanner...");
+      
+      // Secondary fallback
+      setTimeout(() => {
+        setScanState("idle");
+        alert("Server communication error. Please ensure the backend dev server is active and running.");
+      }, 1000);
+    }
+  };
+
+  // Trigger Remediation Workflow ("Fix" Action)
+  const triggerRemediation = async (vuln: Vulnerability) => {
+    const fileToFix = loadedFiles.find(f => f.path === vuln.filePath || f.name === vuln.filePath.split('/').pop());
+    if (!fileToFix) {
+      alert("Associated file contexts could not be matched. Make sure files are loaded.");
+      return;
+    }
+
+    setRemediatingIdState(prev => ({ ...prev, [vuln.id]: "fixing" }));
+
+    try {
+      const response = await fetch("/api/remediate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filePath: fileToFix.path,
+          fileContent: fileToFix.content,
+          vulnerability: vuln
+        })
+      });
+
+      const data = await response.json();
+
+      setVulnerabilities(prev => prev.map(v => {
+        if (v.id === vuln.id) {
+          return {
+            ...v,
+            remediatedSnippet: data.remediatedSnippet,
+            remediationExplanation: data.remediationExplanation,
+            // also keep track of what the full repaired file will look like
+            fullRemediatedContent: data.fullRemediatedContent
+          } as any;
+        }
+        return v;
+      }));
+
+      setRemediatingIdState(prev => ({ ...prev, [vuln.id]: "diff_ready" }));
+
+    } catch (err) {
+      console.error("Remediation repair API trigger failed:", err);
+      alert("Error generating fix. Please retry or adjust code.");
+      setRemediatingIdState(prev => ({ ...prev, [vuln.id]: "idle" }));
+    }
+  };
+
+  // Action: Ignore Card
+  const handleIgnoreVulnerability = (id: string) => {
+    setVulnerabilities(prev => prev.map(v => {
+      if (v.id === id) {
+        return { ...v, status: "Ignored" };
+      }
+      return v;
+    }));
+  };
+
+  // Action: Not a Vulnerability
+  const handleRemoveVulnerability = (id: string) => {
+    setVulnerabilities(prev => prev.filter(v => v.id !== id));
+    if (selectedVulnerabilityId === id) {
+      setSelectedVulnerabilityId(null);
+    }
+  };
+
+  // Action: Approve Remediation
+  const handleApproveRemediation = (vuln: any) => {
+    // 1. Permanently update original file's state
+    if (vuln.fullRemediatedContent) {
+      setLoadedFiles(prev => prev.map(f => {
+        if (f.path === vuln.filePath || f.name === vuln.filePath.split('/').pop()) {
+          return {
+            ...f,
+            content: vuln.fullRemediatedContent
+          };
+        }
+        return f;
+      }));
+    }
+
+    // 2. Mark card as approved
+    setVulnerabilities(prev => prev.map(v => {
+      if (v.id === vuln.id) {
+        return { ...v, status: "Approved" };
+      }
+      return v;
+    }));
+
+    setRemediatingIdState(prev => ({ ...prev, [vuln.id]: "approved" }));
+  };
+
+  // Action: Reject Remediation
+  const handleRejectRemediation = (id: string) => {
+    setRemediatingIdState(prev => ({ ...prev, [id]: "idle" }));
+    setVulnerabilities(prev => prev.map(v => {
+      if (v.id === id) {
+        return { 
+          ...v, 
+          remediatedSnippet: undefined, 
+          remediationExplanation: undefined 
+        } as any;
+      }
+      return v;
+    }));
+  };
+
+  // Count summary stats
+  const stats = useMemo(() => {
+    const totalCount = vulnerabilities.length;
+    const active = vulnerabilities.filter(v => v.status !== "Ignored" && v.status !== "Approved");
+    const high = active.filter(v => v.severity === "High").length;
+    const medium = active.filter(v => v.severity === "Medium").length;
+    const low = active.filter(v => v.severity === "Low").length;
+    const fixed = vulnerabilities.filter(v => v.status === "Approved").length;
+
+    return {
+      total: totalCount,
+      activeCount: active.length,
+      high,
+      medium,
+      low,
+      fixed
+    };
+  }, [vulnerabilities]);
+
+  // Click a vulnerability to highlight that line in IDE workspace
+  const handleVulnerabilityClick = (v: Vulnerability) => {
+    setSelectedVulnerabilityId(v.id);
+    
+    // Find matching active file index and transition IDE focus
+    const matchedIdx = loadedFiles.findIndex(f => f.path === v.filePath || f.name === v.filePath.split('/').pop());
+    if (matchedIdx !== -1) {
+      setActiveFileIndex(matchedIdx);
+      
+      // Auto scroll code editor container to lines of interest, if possible
+      setTimeout(() => {
+        const targetElement = document.getElementById(`line-anchor-${v.lineNumber}`);
+        if (targetElement) {
+          targetElement.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }, 100);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-tr from-[#fbcfe8]/35 via-[#e6f4ea]/45 to-[#ccfbf1]/40 text-slate-800 font-sans p-4 md:p-6 selection:bg-emerald-500/20 selection:text-emerald-950 relative overflow-hidden">
+      {/* Background colorful glassmorphic blur shapes with hints of green */}
+      <div className="absolute top-[-10%] left-[-10%] w-[50vw] h-[50vw] rounded-full bg-gradient-to-tr from-pink-300/30 to-emerald-255/20 blur-[140px] opacity-70 pointer-events-none animate-pulse duration-[10s]" />
+      <div className="absolute bottom-[5%] right-[-10%] w-[55vw] h-[55vw] rounded-full bg-gradient-to-tr from-sky-200/25 via-[#e6f4ea]/30 to-emerald-300/25 blur-[160px] opacity-75 pointer-events-none animate-pulse duration-[15s]" />
+      <div className="absolute top-[25%] right-[10%] w-[45vw] h-[45vw] rounded-full bg-gradient-to-tr from-emerald-300/25 via-teal-200/20 to-green-300/25 blur-[140px] opacity-75 pointer-events-none animate-pulse duration-[12s]" />
+
+      {/* Container holding general borders */}
+      <div className="max-w-[1550px] mx-auto space-y-6 relative z-10">
+        
+        {/* HEADER SECTION */}
+        <header className="flex flex-col md:flex-row justify-between items-start md:items-center border border-white/60 bg-white/60 p-5 rounded-3xl gap-4 backdrop-blur-xl shadow-xl shadow-slate-200/30">
+          <div className="flex items-center gap-3">
+            <div className="bg-gradient-to-tr from-emerald-500 via-teal-500 to-indigo-600 text-white p-3.5 rounded-2xl shadow-lg shadow-emerald-500/20 animate-bounce-slow">
+              <Shield className="w-7 h-7" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-black tracking-tight bg-gradient-to-r from-rose-600 via-indigo-600 to-emerald-600 bg-clip-text text-transparent flex items-center gap-2">
+                CodeElixir.AI
+                <span className="text-[10px] bg-emerald-500/10 text-emerald-700 border border-emerald-500/20 px-2.5 py-0.5 rounded-full uppercase tracking-widest font-mono font-bold">
+                  JAVA AUDITOR v1.1
+                </span>
+              </h1>
+              <p className="text-xs text-slate-600 mt-1 font-medium leading-relaxed">
+                Execute deep AST-level data flow threat scanning and secure prompt remediation using server-contained LLM engines.
+              </p>
+            </div>
+          </div>
+
+          {/* Quick Stats Grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 w-full md:w-auto">
+            <div className="bg-white/40 border border-white/60 p-2.5 rounded-2xl text-center min-w-[105px] shadow-sm">
+              <div className="text-[9px] uppercase font-mono tracking-wider text-slate-500 font-bold">Loaded Files</div>
+              <div className="text-lg font-extrabold text-slate-800 mt-0.5">{loadedFiles.length}</div>
+            </div>
+            <div className="bg-white/40 border border-white/60 p-2.5 rounded-2xl text-center min-w-[105px] shadow-sm">
+              <div className="text-[9px] uppercase font-mono tracking-wider text-slate-500 font-bold">Threats Active</div>
+              <div className="text-lg font-extrabold text-rose-600 mt-0.5 flex justify-center items-center gap-1.5">
+                {stats.activeCount}
+                {stats.high > 0 && <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse" />}
+              </div>
+            </div>
+            <div className="bg-white/40 border border-white/60 p-2.5 rounded-2xl text-center min-w-[105px] shadow-sm">
+              <div className="text-[9px] uppercase font-mono tracking-wider text-slate-500 font-bold">Severity Matrix</div>
+              <div className="text-xs text-slate-700 font-mono mt-1 flex justify-center gap-1">
+                <span className="text-rose-700 bg-rose-105/50 px-1 rounded border border-rose-200 text-[10px]" title="High">{stats.high}H</span>
+                <span className="text-amber-700 bg-amber-105/50 px-1 rounded border border-amber-200 text-[10px]" title="Medium">{stats.medium}M</span>
+              </div>
+            </div>
+            <div className="bg-white/40 border border-white/60 p-2.5 rounded-2xl text-center min-w-[105px] shadow-sm hover:border-emerald-300/60 transition-colors">
+              <div className="text-[9px] uppercase font-mono tracking-wider text-slate-500 font-bold">Auto Patches</div>
+              <div className="text-lg font-extrabold text-emerald-600 mt-0.5 flex justify-center items-center gap-1">
+                {stats.fixed} <Check className="w-4 h-4 text-emerald-500 stroke-[3]" />
+              </div>
+            </div>
+          </div>
+        </header>
+
+        {/* WORKSPACE DIVIDER GRID */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          
+          {/* LEFT COLUMN: CONTROL & FINDINGS PANEL (7 COLS) */}
+          <div className="lg:col-span-7 space-y-6">
+
+            {/* CONTROL AND LOADING INTERFACES */}
+            <section className="border border-white/60 bg-white/50 p-5 rounded-3xl space-y-4 backdrop-blur-md shadow-xl shadow-slate-200/20">
+              <h2 className="text-xs font-bold tracking-wider text-slate-600 uppercase flex items-center gap-2">
+                <FolderOpen className="w-4 h-4 text-emerald-500" /> File & Project Selection
+              </h2>
+
+              {/* Demo Projects Selector Bar */}
+              <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/60 space-y-2">
+                <label className="text-[10px] font-mono uppercase text-slate-400 font-bold block">Select Preset Demo Projects</label>
+                <div className="flex flex-wrap gap-2">
+                  {DEMO_PROJECTS.map((project, idx) => (
+                    <button
+                      key={project.name}
+                      onClick={() => handleSelectProject(idx)}
+                      className={`px-3 py-2.5 text-xs rounded-xl transition-all text-left flex-1 border ${
+                        selectedProjectIndex === idx && loadedFiles === project.files
+                          ? "bg-gradient-to-tr from-rose-50 to-indigo-50/70 text-indigo-750 border-indigo-300 font-bold shadow-sm"
+                          : "bg-white border-slate-200/80 text-slate-600 hover:text-slate-900 hover:bg-slate-50 hover:border-slate-300"
+                      }`}
+                    >
+                      <div className="font-extrabold block truncate text-slate-800">{project.name}</div>
+                      <div className="text-[10px] text-slate-400 font-medium mt-0.5 truncate">{project.files.length} Files</div>
+                    </button>
+                  ))}
+                  
+                  {/* Upload SandBox Button */}
+                  <button
+                    onClick={() => {
+                      setSandboxFileName("PaymentVerificationService.java");
+                      setSandboxCode(`package com.bank.auth;
+
+import java.sql.*;
+
+public class PaymentVerificationService {
+    // SECURITY RISK: Hardcoded root tokens and SQL dynamic statements
+    private static final String API_SECRET = "AI_STUDIO_TEST_TOKEN_2026_XYZ123";
+
+    public void processPaymentAndLog(String accountId, double amount, String notes) {
+        try {
+            Connection conn = DriverManager.getConnection("jdbc:postgresql://localhost/bankdb", "root", API_SECRET);
+            Statement stmt = conn.createStatement();
+            
+            // Highly vulnerable SQL string concatenation
+            String query = "UPDATE accounts SET balance = balance - " + amount + " WHERE customer_id = '" + accountId + "'";
+            stmt.executeUpdate(query);
+            System.out.println("Payment Processed securely for Account: " + accountId);
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+}`);
+                      setIsSandboxOpen(true);
+                    }}
+                    className="px-4 py-2.5 text-xs bg-white border border-slate-200 hover:border-indigo-300/80 hover:bg-indigo-50/30 text-indigo-650 rounded-xl transition-all block text-center min-w-[120px] flex items-center justify-center gap-1.5 font-bold shadow-sm"
+                  >
+                    <Code2 className="w-3.5 h-3.5 text-indigo-500" /> Web Playground
+                  </button>
+                </div>
+              </div>
+
+              {/* Advanced Drag & Drop / File selection area */}
+              <div 
+                className={`transition-all border-2 border-dashed rounded-2xl p-5 text-center cursor-pointer ${
+                  isDragging 
+                    ? "border-rose-450 bg-rose-500/5 text-rose-700" 
+                    : "border-slate-200/80 bg-white/40 hover:border-slate-350 hover:bg-white/70 text-slate-500"
+                }`}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <div className="flex flex-col items-center gap-2">
+                  <div className="p-3 bg-rose-50 text-rose-500 rounded-2xl border border-rose-100">
+                    <FolderOpen className="w-6 h-6" />
+                  </div>
+                  <p className="text-xs text-slate-700 font-bold">
+                    Drag and Drop .java files or folder directories here
+                  </p>
+                  <p className="text-[10px] text-slate-400 font-medium">
+                    Or click to navigate system folder files. Supports selecting multiple java classes.
+                  </p>
+                </div>
+
+                {/* Hidden File Inputs */}
+                <input 
+                  type="file" 
+                  ref={fileInputRef} 
+                  onChange={handleFileChange} 
+                  multiple 
+                  accept=".java" 
+                  className="hidden" 
+                />
+              </div>
+
+              {/* Selection Status Banner */}
+              <div className="flex flex-wrap justify-between items-center bg-slate-50 p-3 rounded-2xl border border-slate-200/60 gap-3">
+                <div className="text-xs text-slate-600 flex items-center gap-2 font-medium">
+                  <FileCode className="w-4 h-4 text-indigo-500" />
+                  Status: <span className="font-mono text-slate-800 font-bold">{loadedFiles.length} java source paths parsed.</span>
+                </div>
+                
+                {loadedFiles.length > 0 && (
+                  <button
+                    onClick={triggerCodeScan}
+                    disabled={scanState === "scanning"}
+                    className={`px-5 py-2.5 rounded-xl text-xs font-bold tracking-wide shadow-md transition-all flex items-center gap-2 ${
+                      scanState === "scanning"
+                        ? "bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300"
+                        : "bg-gradient-to-r from-rose-500 to-indigo-600 text-white hover:opacity-90 active:scale-95 cursor-pointer"
+                    }`}
+                  >
+                    {scanState === "scanning" ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-rose-450" /> Evaluating AST...
+                      </>
+                    ) : (
+                      <>
+                        <Cpu className="w-3.5 h-3.5" /> Analyze Java Project
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+
+              {/* PROGRESS VIEW FOR ACTIVE SCANNING */}
+              <AnimatePresence>
+                {scanState === "scanning" && (
+                  <motion.div 
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    className="bg-white/80 p-4 border border-slate-250 rounded-2xl space-y-2 shadow-sm"
+                  >
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-rose-600 flex items-center gap-2 font-mono font-bold">
+                        <Terminal className="w-3 h-3 text-rose-500 animate-pulse" /> {scanProgressText}
+                      </span>
+                      <span className="font-mono font-bold text-slate-700">{scanProgress}%</span>
+                    </div>
+                    
+                    {/* Visual Progress Bar Wrapper */}
+                    <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden border border-slate-200/60">
+                      <motion.div 
+                        className="bg-gradient-to-r from-rose-500 via-pink-400 to-indigo-500 h-full rounded-full"
+                        initial={{ width: "0%" }}
+                        animate={{ width: `${scanProgress}%` }}
+                        transition={{ duration: 0.1 }}
+                      />
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </section>
+
+            {/* PASTE DIALOG SHEETS */}
+            <AnimatePresence>
+              {isSandboxOpen && (
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.95 }}
+                  className="bg-white/95 backdrop-blur-xl border border-white/60 p-5 rounded-3xl space-y-4 shadow-2xl shadow-indigo-100"
+                >
+                  <div className="flex justify-between items-center border-b border-slate-100 pb-2">
+                    <h3 className="text-xs font-bold font-mono text-slate-800 flex items-center gap-2">
+                      <Code2 className="w-4 h-4 text-rose-500" /> Java Coding SandBox Playground
+                    </h3>
+                    <button 
+                      onClick={() => setIsSandboxOpen(false)}
+                      className="text-slate-400 hover:text-slate-600"
+                    >
+                      <XCircle className="w-5 h-5" />
+                    </button>
+                  </div>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-[10px] font-mono text-slate-400 block mb-1">Dummy Filename (.java)</label>
+                      <input 
+                        type="text" 
+                        value={sandboxFileName}
+                        onChange={(e) => setSandboxFileName(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 font-mono focus:border-rose-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] font-mono text-slate-400 block mb-1">Java Source Code</label>
+                      <textarea
+                        rows={12}
+                        value={sandboxCode}
+                        onChange={(e) => setSandboxCode(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-800 font-mono focus:border-rose-500 focus:outline-none focus:ring-1 focus:ring-rose-500/30"
+                        placeholder="Paste your custom vulnerable Class structures..."
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <button
+                      onClick={() => setIsSandboxOpen(false)}
+                      className="px-3.5 py-1.5 text-xs text-slate-400 hover:text-slate-600 transition-all font-semibold"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleAddSandboxFile}
+                      className="px-4 py-2 text-xs bg-rose-500 hover:bg-rose-600 transition-all text-white font-bold rounded-xl shadow-md shadow-rose-500/10"
+                    >
+                      Load Into Explorer
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* VULNERABILITY CARDS SECTION */}
+            <div className="space-y-4">
+              <div className="flex justify-between items-center">
+                <h2 className="text-xs font-bold tracking-wider text-slate-600 uppercase flex items-center gap-2">
+                  <Flame className="w-4 h-4 text-rose-500" /> Scan Results Findings ({vulnerabilities.filter(v => v.status !== 'Ignored').length})
+                </h2>
+                
+                {/* Active scan engines declaration */}
+                {scanState === "completed" && (
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                    scanMode === "gemini_ai" 
+                      ? "bg-purple-50 text-purple-600 border-purple-200 font-bold" 
+                      : "bg-slate-100 text-slate-600 border-slate-200"
+                  }`}>
+                    Engine: {scanMode === "gemini_ai" ? "Gemini AI (Complete AST API)" : "Offline Static Heuristics Backend"}
+                  </span>
+                )}
+              </div>
+
+              {scanState === "idle" && (
+                <div className="border border-white/65 bg-white/45 p-10 rounded-3xl text-center space-y-4 shadow-sm backdrop-blur-md">
+                  <div className="mx-auto w-12 h-12 bg-white border border-slate-200 rounded-2xl flex items-center justify-center text-slate-400 shadow-sm">
+                    <Shield className="w-6 h-6 text-indigo-500" />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-sm font-bold text-slate-800">No active audit logs available</p>
+                    <p className="text-xs text-slate-500 max-w-sm mx-auto leading-relaxed font-semibold">
+                      Review files or select a preset project, and hit <strong className="text-rose-500 font-bold">"Analyze Java Project"</strong> above to extract findings.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {scanState === "completed" && vulnerabilities.length === 0 && (
+                <div className="border border-white/65 bg-white/45 p-10 rounded-3xl text-center space-y-2 shadow-sm">
+                  <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto" />
+                  <p className="text-sm font-bold text-slate-800">Clean Bill of Health!</p>
+                  <p className="text-xs text-slate-500 font-semibold">We could not identify any vulnerability parameters inside scanned Java files.</p>
+                </div>
+              )}
+
+              {scanState === "completed" && (
+                <div className="space-y-4">
+                  {vulnerabilities.map((v) => {
+                    const localState = remediatingIdState[v.id] || "idle";
+                    
+                    // Hide Card if Ignored
+                    if (v.status === "Ignored") return null;
+
+                    const isHigh = v.severity === "High";
+                    const isMed = v.severity === "Medium";
+                    const isLow = v.severity === "Low";
+                    const isApproved = v.status === "Approved";
+
+                    return (
+                      <motion.article 
+                        key={v.id}
+                        layoutId={`card-${v.id}`}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className={`border rounded-3xl overflow-hidden transition-all duration-300 bg-white/60 backdrop-blur-md relative ${
+                          selectedVulnerabilityId === v.id 
+                            ? "border-rose-500 ring-2 ring-rose-500/15 shadow-lg" 
+                            : isApproved 
+                              ? "border-emerald-200 opacity-80"
+                              : "border-white/70 hover:border-slate-300 shadow-sm"
+                        }`}
+                        onClick={() => handleVulnerabilityClick(v)}
+                      >
+                        {/* High priority attention bar */}
+                        <div className={`h-1.5 w-full ${
+                          isApproved 
+                            ? "bg-emerald-500" 
+                            : isHigh 
+                              ? "bg-rose-500" 
+                              : isMed 
+                                ? "bg-amber-500" 
+                                : "bg-sky-400"
+                        }`} />
+
+                        <div className="p-5 space-y-4">
+                          
+                          {/* Top Tag Header */}
+                          <div className="flex flex-wrap justify-between items-center gap-2">
+                            <div className="flex items-center gap-2">
+                              {/* Severity Badge */}
+                              <span className={`text-[10px] uppercase tracking-wider font-bold px-2.5 py-0.5 rounded-full ${
+                                isApproved
+                                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200/60"
+                                  : isHigh 
+                                    ? "bg-rose-50 text-rose-700 border border-rose-200/60"
+                                    : isMed
+                                      ? "bg-amber-50 text-amber-700 border border-amber-200/60"
+                                      : "bg-sky-50 text-sky-700 border border-sky-200/60"
+                              }`}>
+                                {isApproved ? "Resolved" : `${v.severity} Severity`}
+                              </span>
+
+                              <span className="text-xs font-bold text-slate-800 font-sans">
+                                {v.type}
+                              </span>
+                            </div>
+
+                            {/* Line Number indicator */}
+                            <span className="font-mono text-[9px] text-slate-500 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200/80 font-bold col-span-2">
+                              {v.filePath.split("/").pop()}:{v.lineNumber}
+                            </span>
+                          </div>
+
+                          {/* Vulnerability Description exploration */}
+                          <p className="text-xs text-slate-600 leading-relaxed font-semibold">
+                            {v.description}
+                          </p>
+
+                          {/* Code Snippet displaying before state */}
+                          <div className="space-y-1.5">
+                            <label className="text-[9px] font-mono text-slate-400 uppercase block tracking-wider font-bold">Vulnerable Source Code Segment</label>
+                            <div className="font-mono text-xs bg-rose-950/5 p-3 rounded-2xl border border-rose-100/60 text-rose-900 overflow-x-auto select-all max-w-full whitespace-pre break-all font-bold">
+                              {v.snippet}
+                            </div>
+                          </div>
+
+                          {/* ACTION TOOLBAR */}
+                          <div className="flex flex-wrap justify-between items-center border-t border-slate-100 pt-4 gap-3">
+                            
+                            {/* Action Buttons for active logs */}
+                            {!isApproved && localState === "idle" && (
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    triggerRemediation(v);
+                                  }}
+                                  className="px-3.5 py-2 bg-gradient-to-r from-rose-500 via-rose-500 to-indigo-600 text-white font-bold text-xs rounded-xl transition-all shadow-md shadow-rose-500/10 cursor-pointer flex items-center gap-1.5"
+                                >
+                                  <Sparkles className="w-3.5 h-3.5 animate-pulse" /> Fix Security Issue
+                                </button>
+                                
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleIgnoreVulnerability(v.id);
+                                  }}
+                                  className="px-3 py-2 bg-white border border-slate-200 hover:text-amber-600 hover:border-amber-300 hover:bg-amber-50/10 text-slate-500 text-xs rounded-xl transition-all font-bold shadow-sm"
+                                >
+                                  Ignore
+                                </button>
+
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRemoveVulnerability(v.id);
+                                  }}
+                                  className="px-2.5 py-2 bg-white hover:bg-slate-50 border border-slate-200 hover:text-slate-700 text-slate-400 text-xs rounded-xl transition-all font-semibold shadow-sm"
+                                  title="Dismiss altogether"
+                                >
+                                  Not a vuln
+                                </button>
+                              </div>
+                            )}
+
+                            {/* IF REMEDIATING LOADING STATE */}
+                            {localState === "fixing" && (
+                              <div className="text-xs text-rose-600 flex items-center gap-2 font-mono py-1 font-bold">
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin text-rose-550" />
+                                Triggering server model remediation repair mechanisms...
+                              </div>
+                            )}
+
+                            {/* DIFF VIEW READY WORKFLOWS */}
+                            <AnimatePresence>
+                              {localState === "diff_ready" && v.remediatedSnippet && (
+                                <motion.div 
+                                  initial={{ opacity: 0, height: 0 }}
+                                  animate={{ opacity: 1, height: "auto" }}
+                                  exit={{ opacity: 0, height: 0 }}
+                                  className="w-full space-y-4 pt-1"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {/* Code Diff Display Row */}
+                                  <div className="bg-white p-4 rounded-2xl border border-rose-200/50 space-y-3 shadow-inner">
+                                    <h4 className="text-[9px] font-bold font-mono tracking-widest text-rose-700 uppercase flex items-center gap-2">
+                                      <GitCommit className="w-3.5 h-3.5 text-rose-500" /> side-by-side remediation comparison
+                                    </h4>
+                                    
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                      {/* Old segment block */}
+                                      <div className="bg-red-50/70 p-3 rounded-xl border border-red-100 text-left">
+                                        <div className="text-red-750 font-sans text-[9px] mb-2 uppercase font-extrabold text-red-650">ORIGINAL</div>
+                                        <div className="font-mono text-xs text-red-900 border-l-2 border-red-400 pl-2 select-all overflow-x-auto whitespace-pre max-w-full font-semibold">
+                                          {v.snippet}
+                                        </div>
+                                      </div>
+
+                                      {/* Corrected segment block */}
+                                      <div className="bg-emerald-50/80 p-3 rounded-xl border border-emerald-100 text-left">
+                                        <div className="text-emerald-700 font-sans text-[9px] mb-2 uppercase font-extrabold flex items-center gap-1.5">
+                                          PROPOSED SECURE DEVIATION 
+                                          <Sparkles className="w-2.5 h-2.5 text-emerald-650 animated-pulse" />
+                                        </div>
+                                        <div className="font-mono text-xs text-emerald-800 border-l-2 border-emerald-450 pl-2 select-all overflow-x-auto whitespace-pre max-w-full font-bold">
+                                          {v.remediatedSnippet}
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    {/* Detailed technical explanation */}
+                                    {v.remediationExplanation && (
+                                      <div className="mt-3 text-xs bg-slate-50 border border-slate-200 p-3 rounded-xl text-slate-600 flex gap-2">
+                                        <Info className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
+                                        <div className="space-y-1">
+                                          <strong className="text-slate-800 text-[10px] uppercase tracking-wider block font-mono font-bold">Remediation Action</strong>
+                                          <p className="leading-relaxed font-semibold text-slate-600">{v.remediationExplanation}</p>
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {/* Action approval triggers */}
+                                    <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+                                      <button
+                                        onClick={() => handleRejectRemediation(v.id)}
+                                        className="px-3 py-1.5 text-xs text-slate-400 hover:text-slate-700 hover:bg-slate-50 rounded-xl transition-all font-bold"
+                                      >
+                                        Reject Corrective
+                                      </button>
+                                      
+                                      <button
+                                        onClick={() => handleApproveRemediation(v)}
+                                        className="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-600 border border-emerald-450 text-white font-extrabold text-xs rounded-xl transition-all shadow-md shadow-emerald-500/10 flex items-center gap-1.5 cursor-pointer"
+                                      >
+                                        <Check className="w-3.5 h-3.5" /> Approve & Apply Fix
+                                      </button>
+                                    </div>
+                                  </div>
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+
+                            {/* APPROVED SUCCESS BANNER */}
+                            {localState === "approved" && (
+                              <motion.div 
+                                initial={{ opacity: 0, scale: 0.95 }}
+                                animate={{ opacity: 1, scale: 1 }}
+                                className="w-full bg-emerald-50 text-emerald-800 border border-emerald-250 p-3.5 rounded-2xl flex items-center justify-between gap-2 shadow-sm"
+                              >
+                                <div className="flex items-center gap-2 text-xs font-mono font-bold">
+                                  <FileCheck className="w-4 h-4 text-emerald-650" />
+                                  Vulnerability permanently resolved! File records corrected in active scope memory.
+                                </div>
+                                <span className="text-[9px] font-bold text-emerald-700 bg-emerald-200/50 uppercase border border-emerald-350 px-2.5 py-0.5 rounded-full font-sans">
+                                  Approved & Committed
+                                </span>
+                              </motion.div>
+                            )}
+
+                          </div>
+
+                        </div>
+                      </motion.article>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+          </div>
+
+          {/* RIGHT COLUMN: ACTIVE INTERACTIVE IDE / CODE VIEWER (5 COLS) */}
+          <section className="lg:col-span-5 border border-white/60 bg-white/55 p-5 rounded-3xl flex flex-col h-[calc(100vh-140px)] min-h-[550px] sticky top-6 backdrop-blur-md shadow-xl shadow-slate-200/20">
+            
+            {/* Tab selection panel */}
+            <div className="flex justify-between items-center border-b border-slate-200 pb-3 mb-4 shrink-0">
+              <h2 className="text-xs font-bold tracking-wider text-slate-600 uppercase flex items-center gap-2">
+                <FileCode className="w-4 h-4 text-emerald-500" /> Workspace Native Files
+              </h2>
+              
+              <span className="text-[9px] font-mono text-slate-500 bg-slate-50 border border-slate-250/80 px-2.5 py-1 rounded-lg font-bold">
+                {loadedFiles.length} File Records
+              </span>
+            </div>
+
+            {/* Flat Explorer tab labels */}
+            <div className="flex gap-1 overflow-x-auto pb-2 shrink-0 max-w-full">
+              {loadedFiles.map((file, idx) => {
+                const isActive = activeFileIndex === idx;
+                
+                // Count active vulnerabilities inside this specific file path to show a badge count
+                const fileVulns = vulnerabilities.filter(v => v.status !== "Ignored" && v.status !== "Approved" && (v.filePath === file.path || v.filePath === file.name));
+
+                return (
+                  <button
+                    key={file.path || file.name}
+                    onClick={() => {
+                      setActiveFileIndex(idx);
+                      setSelectedVulnerabilityId(null);
+                    }}
+                    className={`px-3 py-2 text-xs font-mono rounded-xl transition-all shrink-0 border flex items-center gap-2 ${
+                      isActive 
+                        ? "bg-white text-slate-800 border-slate-300 shadow-md shadow-slate-200/40 font-bold" 
+                        : "bg-white/40 text-slate-500 border-slate-200/60 hover:bg-white/80 hover:text-slate-850"
+                    }`}
+                  >
+                    <FileCode className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                    <span className="truncate max-w-[120px] font-sans">{file.name}</span>
+                    
+                    {/* Vuln Indicators badge */}
+                    {fileVulns.length > 0 && (
+                      <span className="w-4.5 h-4.5 bg-rose-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center shrink-0 shadow-sm">
+                        {fileVulns.length}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Core Code Viewer Screen */}
+            <div className="flex-1 min-h-0 bg-slate-900 rounded-2xl border border-slate-950 overflow-hidden flex flex-col relative shadow-xl">
+              
+              {activeFile ? (
+                <>
+                  {/* Pseudo IDE status header */}
+                  <div className="bg-slate-950 px-4 py-2 text-xs border-b border-slate-900/80 flex justify-between items-center shrink-0">
+                    <span className="font-mono text-slate-400 truncate max-w-xs">{activeFile.path}</span>
+                    <span className="font-mono text-[9px] text-slate-500 font-semibold">Parser: JAVA (UTF-8)</span>
+                  </div>
+
+                  {/* Lines container element */}
+                  <div className="flex-1 overflow-y-auto font-mono text-xs p-4 leading-relaxed select-text select-all bg-slate-900/95 scrollbar-thin">
+                    {activeFile.content.split("\n").map((lineContent, idx) => {
+                      const lineNum = idx + 1;
+                      
+                      // Check if this line corresponds to a critical active vulnerability
+                      const matchingVuln = vulnerabilities.find(
+                        v => v.status !== "Ignored" && 
+                             v.status !== "Approved" && 
+                             v.lineNumber === lineNum && 
+                             (v.filePath === activeFile.path || v.filePath === activeFile.name)
+                      );
+
+                      const isLineMatched = matchingVuln !== undefined;
+                      const isVulnerabilitySelected = matchingVuln && selectedVulnerabilityId === matchingVuln.id;
+
+                      return (
+                        <div 
+                          key={idx} 
+                          id={`line-anchor-${lineNum}`}
+                          className={`flex items-start transition-all ${
+                            isVulnerabilitySelected 
+                              ? "bg-rose-500/20 border-l-4 border-rose-500 -ml-4 pl-3" 
+                              : isLineMatched
+                                ? "bg-rose-950/20 border-l-2 border-rose-450 -ml-4 pl-3.5 cursor-pointer text-rose-350 font-semibold" 
+                                : "text-slate-300"
+                          }`}
+                          onClick={() => matchingVuln && handleVulnerabilityClick(matchingVuln)}
+                          title={matchingVuln ? `Click to inspect: ${matchingVuln.type}` : undefined}
+                        >
+                          {/* Code line enumeration numbers */}
+                          <div className="text-slate-500 w-7 select-none text-right pr-3 font-mono text-[10px] opacity-40 shrink-0">
+                            {lineNum}
+                          </div>
+                          
+                          {/* Live content characters */}
+                          <div className={`whitespace-pre break-all ${isLineMatched ? "font-bold bg-rose-500/10 px-1 rounded text-rose-100" : ""}`}>
+                            {renderHighlightedCode(lineContent)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              ) : (
+                <div className="flex-1 flex flex-col items-center justify-center text-center p-8 text-slate-500 bg-slate-900">
+                  <FileCode className="w-10 h-10 mb-2 opacity-30 text-emerald-500" />
+                  <p className="text-xs">Select or upload Java file inputs to active explorer.</p>
+                </div>
+              )}
+
+            </div>
+
+            {/* Interactive User documentation prompt block */}
+            <div className="mt-4 shrink-0 bg-emerald-50/40 p-3.5 rounded-2xl border border-emerald-100/60 text-xs text-slate-500 flex gap-2">
+              <KeyRound className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                <span className="font-extrabold text-slate-750">Auditor LLM Engine Credentials</span>
+                <p className="leading-relaxed font-semibold text-[11px] text-emerald-600/80">
+                  Advanced reasoning works seamlessly via your secure Gemini API secrets. Add your key inside the <strong className="text-emerald-750 font-bold">Settings &gt; Secrets</strong> dashboard panel to unlock complete sandbox parsing.
+                </p>
+              </div>
+            </div>
+
+          </section>
+
+        </div>
+
+      </div>
+    </div>
+  );
+}

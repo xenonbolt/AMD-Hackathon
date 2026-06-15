@@ -160,7 +160,8 @@ def run_codebase_scan(
     output_report: str = "security_report.json",
     use_chunks: bool = False,
     load_in_4bit: bool = True,
-    max_tokens: int = 1024
+    max_tokens: int = 1024,
+    min_confidence: float = 0.0
 ) -> None:
     """
     Recursively scans a target directory for Java source files, reads and analyzes their
@@ -215,7 +216,12 @@ def run_codebase_scan(
                 raw_code = chunk["content"]
                 
                 # Execute inference and exception-safe JSON parsing
-                result = engine.analyze_file_content(raw_code, max_new_tokens=max_tokens)
+                result = engine.analyze_file_content(
+                    raw_code, 
+                    max_new_tokens=max_tokens,
+                    file_line_count=len(raw_code.splitlines()),
+                    min_confidence=min_confidence
+                )
 
                 # Check if parsing or inference failed
                 if "error" in result:
@@ -284,6 +290,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_chunks", action="store_true", help="Enable method-level code segmentation")
     parser.add_argument("--no_quant", action="store_true", help="Disable 4-bit quantization")
     parser.add_argument("--max_tokens", type=int, default=1024, help="Maximum new tokens to generate per inference call")
+    parser.add_argument("--min_confidence", type=float, default=0.0, help="Minimum confidence score to include finding (e.g. 0.8)")
     args = parser.parse_args()
 
     run_codebase_scan(
@@ -293,5 +300,6 @@ if __name__ == "__main__":
         output_report=args.output_report,
         use_chunks=args.use_chunks,
         load_in_4bit=not args.no_quant,
-        max_tokens=args.max_tokens
+        max_tokens=args.max_tokens,
+        min_confidence=args.min_confidence
     )
