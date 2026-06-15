@@ -14,7 +14,31 @@ from inference_engine import VulnerabilityInferenceEngine
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="CodeElixir.AI Backend API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ProxyMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = dict(scope.get("headers", []))
+            prefix = headers.get(b"x-forwarded-prefix") or headers.get(b"x-forwarded-context") or headers.get(b"x-proxycontextpath")
+            if prefix:
+                scope["root_path"] = prefix.decode("utf-8")
+        await self.app(scope, receive, send)
+
+app.add_middleware(ProxyMiddleware)
 
 # Initialize the engine at startup (lazy load can save boot time, but we'll do global initialization per standard)
 logger.info("Initializing VulnerabilityInferenceEngine...")
@@ -80,7 +104,7 @@ def scan_folder(request: ScanFolderRequest):
             file_line_count = len(code_content.splitlines())
             report = engine.analyze_file_content(
                 code_content,
-                max_new_tokens=1024,
+                max_new_tokens=2048,
                 file_line_count=file_line_count,
                 file_path=str(file_path)
             )
@@ -181,7 +205,7 @@ def scan_contents(request: ScanRequest):
             file_line_count = len(file_obj.content.splitlines())
             report = engine.analyze_file_content(
                 file_obj.content,
-                max_new_tokens=1024,
+                max_new_tokens=2048,
                 file_line_count=file_line_count,
                 file_path=file_obj.path
             )

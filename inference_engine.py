@@ -27,6 +27,16 @@ PROMPT_TEMPLATE = (
     "<|response|>\n"
 )
 
+PROMPT_TEMPLATE = (
+    "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. "
+    "Return structured JSON ONLY inside a top-level \"vulnerabilities\" array. "
+    "For each vulnerability, ensure the 'description' field contains a concise (2-3 sentences) "
+    "but technically precise explanation of the exploit, referencing specific variables and method names. "
+    "Keep explanations brief and direct to optimize response time.\n\n"
+    "<|input|>\n{raw_code}\n\n"
+    "<|response|>\n"
+)
+
 
 class VulnerabilityInferenceEngine:
     """
@@ -567,11 +577,27 @@ class VulnerabilityInferenceEngine:
                 logger.debug(f"Vulnerability entry missing cwe_id/cwe_name, filled default: {vuln}")
 
             # Properly infer CWE using our generalized heuristics and keyword mapping
-            if not vuln.get("cwe_id"):
-                inferred_id, inferred_name = VulnerabilityInferenceEngine._infer_cwe(vuln, code_content)
-                if inferred_id:
-                    vuln["cwe_id"] = inferred_id
-                    vuln["cwe_name"] = inferred_name
+            # Always run inference to fix hallucinated mappings (e.g. CWE-22 for Command Injection)
+            old_id = vuln.get("cwe_id", "")
+            old_name = vuln.get("cwe_name", "")
+            
+            inferred_id, inferred_name = VulnerabilityInferenceEngine._infer_cwe(vuln, code_content)
+            if inferred_id:
+                vuln["cwe_id"] = inferred_id
+                vuln["cwe_name"] = inferred_name
+                
+                # Sanitize descriptive fields to replace hallucinated names with the corrected ones
+                for field in ["description", "impact", "recommendation", "message"]:
+                    if vuln.get(field) and isinstance(vuln[field], str):
+                        text = vuln[field]
+                        if old_id and old_id != inferred_id:
+                            text = text.replace(old_id, inferred_id)
+                        if old_name and old_name != inferred_name:
+                            clean_old = old_name.split("(")[0].strip()
+                            clean_new = inferred_name.split("(")[0].strip()
+                            if clean_old and clean_old in text:
+                                text = text.replace(clean_old, clean_new)
+                        vuln[field] = text
 
             # Clean CWE name of repetitive patterns
             if "cwe_name" in vuln:
@@ -612,7 +638,15 @@ class VulnerabilityInferenceEngine:
                 logger.info(f"Dropped finding due to low confidence ({vuln['confidence']} < {min_confidence}): {vuln.get('cwe_name')}")
                 continue
 
-            # Code-Aware Post Validation (SINK_HEURISTICS)
+            # Weighted Scoring Validation System
+            # Component 1: Confidence Score Component (Max 40 points)
+            conf_val = vuln.get("confidence", 0.0)
+            confidence_score = conf_val * 40.0
+
+            # Component 2: Sink Validation Component (Max 40 points)
+            sink_score = 20.0  # Default neutral score if no heuristic exists
+            sink_found = False
+            
             if code_content and vuln.get("cwe_id"):
                 cwe = vuln["cwe_id"].upper()
                 sink_heuristics = {
@@ -632,10 +666,45 @@ class VulnerabilityInferenceEngine:
                 }
                 
                 if cwe in sink_heuristics:
-                    if not re.search(sink_heuristics[cwe], code_content):
-                        dropped += 1
-                        logger.warning(f"Code-Aware Validation: Dropped {cwe} hallucination (sink pattern not found in code)")
-                        continue
+                    pattern = sink_heuristics[cwe]
+                    lines = code_content.splitlines()
+                    # Find the actual line number of the sink to correct the location
+                    for i, line in enumerate(lines):
+                        if re.search(pattern, line):
+                            if "location" not in vuln:
+                                vuln["location"] = {}
+                            vuln["location"]["line"] = i + 1
+                            sink_found = True
+                            break
+                    
+                    if sink_found:
+                        sink_score = 40.0
+                    else:
+                        sink_score = 0.0
+
+            # Component 3: False Positive Component (Max 20 points, or penalty)
+            fp_score = 20.0
+            if code_content and "location" in vuln and "line" in vuln["location"]:
+                line_idx = vuln["location"]["line"] - 1
+                lines = code_content.splitlines()
+                if 0 <= line_idx < len(lines):
+                    flagged_line = lines[line_idx]
+                    # Check for false positive patterns (Regex compilation, import, comment, package)
+                    if re.search(r"(Pattern\.compile|java\.util\.regex|^\s*//|^\s*import |^\s*package )", flagged_line):
+                        if not sink_found:
+                            fp_score = -20.0  # Apply penalty if it looks like a false positive and no sink validates it
+                        else:
+                            fp_score = 0.0
+
+            # Final Decision based on Total Weight (Max 100, Threshold 50)
+            total_weight = confidence_score + sink_score + fp_score
+            
+            if total_weight < 50.0:
+                dropped += 1
+                logger.warning(f"Weighted Validation: Dropped {vuln.get('cwe_id')} (Score: {total_weight:.1f}/100) -> Conf: {confidence_score:.1f}, Sink: {sink_score}, FP: {fp_score}")
+                continue
+            else:
+                logger.info(f"Weighted Validation: Kept {vuln.get('cwe_id')} (Score: {total_weight:.1f}/100) -> Conf: {confidence_score:.1f}, Sink: {sink_score}, FP: {fp_score}")
 
             validated.append(vuln)
 

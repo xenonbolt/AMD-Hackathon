@@ -87,10 +87,7 @@ python fine_tune.py \
 ### 3. Run Single File or Project Inference
 To analyze a specific Java file with base + adapter model:
 ```bash
-python inference_engine.py \
-    --model_id "deepseek-ai/deepseek-coder-6.7b-base" \
-    --adapter_path "./adapters" \
-    --target_path "path/to/Snippet.java"
+python inference_engine.py     --model_id "deepseek-ai/deepseek-coder-6.7b-base"     --target_path "sample.java"     --format json --no_quant
 ```
 
 Using a merged offline model:
@@ -115,3 +112,6 @@ python scanner.py \
 
 ## License & Safety Guidelines
 This tool is designed for **defensive application security testing** and **automated vulnerability remediation**. Use this tool responsibly on codebases you are authorized to analyze.
+
+
+$env:VITE_API_BASE="base/proxy/8000"; $env:VITE_JUPYTER_TOKEN="<token>"; npm run dev
