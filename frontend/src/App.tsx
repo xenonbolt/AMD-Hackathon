@@ -23,17 +23,18 @@ import {
   AlertOctagon,
   KeyRound,
   FileSpreadsheet,
-  Info
+  Info,
+  ChevronDown,
+  ChevronUp
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { JavaFile, Vulnerability } from "./types";
-import { DEMO_PROJECTS } from "./data/demoFiles";
+import { JavaFile, Vulnerability, ScanHistoryEntry } from "./types";
 
 // Lightweight regex-based syntax tokenizer for Java code
 function tokenizeJavaLine(line: string): { text: string; type: string }[] {
   if (!line) return [{ text: " ", type: "text" }];
 
-  const regex = /(\/\/.*)|("(\\.|[^"\\])*")|('(\\.|[^'\\])*')|(@[a-zA-Z0-9_]+)|(\b(?:public|private|protected|class|interface|enum|extends|implements|import|package|return|new|if|else|for|while|try|catch|finally|throw|throws|final|static|void|int|double|float|long|boolean|char|short|byte|null|true|false|this|super)\b)|(\b\d+(?:\.\d+)?\b)|(\b[A-Z][a-zA-Z0-9_]*\b)|(\b[a-z_][a-zA-Z0-9_]*(?=\s*\())|([+\-*/%&=<>!|~^:?(){}[\];.,]+)|(\s+)|([^\s]+)/g;
+  const regex = /(\/\/.*)|("(?:\\.|[^"\\])*")|('(?:\\.|[^'\\])*')|(@[a-zA-Z0-9_]+)|(\b(?:public|private|protected|class|interface|enum|extends|implements|import|package|return|new|if|else|for|while|try|catch|finally|throw|throws|final|static|void|int|double|float|long|boolean|char|short|byte|null|true|false|this|super)\b)|(\b\d+(?:\.\d+)?\b)|(\b[A-Z][a-zA-Z0-9_]*\b)|(\b[a-z_][a-zA-Z0-9_]*(?=\s*\())|([+\-*/%&=<>!|~^:?(){}[\];.,]+)|(\s+)|([^\s]+)/g;
 
   const tokens: { text: string; type: string }[] = [];
   let match;
@@ -129,9 +130,56 @@ function renderHighlightedCode(line: string) {
 
 export default function App() {
   // Projects and files
-  const [selectedProjectIndex, setSelectedProjectIndex] = useState<number>(0);
-  const [loadedFiles, setLoadedFiles] = useState<JavaFile[]>(DEMO_PROJECTS[0].files);
+  const [loadedFiles, setLoadedFiles] = useState<JavaFile[]>([]);
   const [activeFileIndex, setActiveFileIndex] = useState<number>(0);
+  const [droppedItemName, setDroppedItemName] = useState<string | null>(null);
+
+  // App Level Tabs
+  const [activeTab, setActiveTab] = useState<"scan" | "history">("scan");
+  const [scanHistory, setScanHistory] = useState<ScanHistoryEntry[]>([]);
+  const [isHistoryLoaded, setIsHistoryLoaded] = useState<boolean>(false);
+  const [expandedHistoryIds, setExpandedHistoryIds] = useState<string[]>([]);
+
+  const toggleHistoryExpanded = (id: string) => {
+    setExpandedHistoryIds(prev => 
+      prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]
+    );
+  };
+
+  // Load history from localstorage directory backend
+  useEffect(() => {
+    fetch('/local-api/history')
+      .then(res => res.json())
+      .then(data => {
+        if (Array.isArray(data)) {
+          setScanHistory(data.map((item: any) => ({
+            ...item,
+            timestamp: new Date(item.timestamp)
+          })));
+        }
+        setIsHistoryLoaded(true);
+      })
+      .catch(err => {
+        console.error("Failed to load history from local server", err);
+        setIsHistoryLoaded(true);
+      });
+  }, []);
+
+  const isInitialMount = useRef(true);
+
+  // Persist history to localstorage directory backend whenever it updates
+  useEffect(() => {
+    if (!isHistoryLoaded) return;
+    if (isInitialMount.current) {
+      isInitialMount.current = false;
+      return;
+    }
+    fetch('/local-api/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(scanHistory)
+    }).catch(err => console.error("Failed to save history to local server", err));
+  }, [scanHistory, isHistoryLoaded]);
 
   // Security elements
   const [vulnerabilities, setVulnerabilities] = useState<Vulnerability[]>([]);
@@ -140,6 +188,7 @@ export default function App() {
   const [scanProgressText, setScanProgressText] = useState<string>("");
   const [scanMode, setScanMode] = useState<"local_heuristics" | "gemini_ai" | "none">("none");
   const [scanMessage, setScanMessage] = useState<string>("");
+  const [isSingleScanActive, setIsSingleScanActive] = useState<boolean>(false);
 
   // Specific remediation states (vulnerabilityId -> "idle" | "fixing" | "diff_ready" | "approved")
   const [remediatingIdState, setRemediatingIdState] = useState<Record<string, "idle" | "fixing" | "diff_ready" | "approved">>({});
@@ -158,20 +207,73 @@ export default function App() {
   const [selectedVulnerabilityId, setSelectedVulnerabilityId] = useState<string | null>(null);
   const activeFile = loadedFiles[activeFileIndex] || null;
 
-  // Initialize demo data on load so they see some initial items
+  // Initialize data on load and auto-recover session
   useEffect(() => {
-    // Loaded files defaulted to Project 0
-    setLoadedFiles(DEMO_PROJECTS[selectedProjectIndex].files);
-    setActiveFileIndex(0);
-    setScanState("idle");
-    setVulnerabilities([]);
+    fetch('/local-api/session')
+      .then(res => res.json())
+      .then(data => {
+        if (data && Array.isArray(data.loadedFiles)) {
+          setLoadedFiles(data.loadedFiles);
+          setActiveFileIndex(data.activeFileIndex || 0);
+          setVulnerabilities(data.vulnerabilities || []);
+          setScanMode(data.scanMode || "none");
+          setScanMessage(data.scanMessage || "");
+          setScanState(data.scanState || "idle");
+          
+          if (data.scanState === "scanning") {
+            // Re-trigger the scan based on the active state
+            if (data.isSingleScanActive) {
+              isRecoveringSingleScan.current = true;
+            } else {
+              isRecoveringGlobalScan.current = true;
+            }
+          }
+        } else {
+          setScanState("idle");
+          setVulnerabilities([]);
+        }
+      })
+      .catch(err => {
+        console.error("Failed to recover session", err);
+        setScanState("idle");
+        setVulnerabilities([]);
+      });
     setSelectedVulnerabilityId(null);
-  }, [selectedProjectIndex]);
+  }, []);
 
-  // Quick preset loading
-  const handleSelectProject = (idx: number) => {
-    setSelectedProjectIndex(idx);
-  };
+  const isRecoveringSingleScan = useRef(false);
+  const isRecoveringGlobalScan = useRef(false);
+
+  // Effect to retrigger scan if we recovered a scanning state
+  useEffect(() => {
+    if (loadedFiles.length > 0 && scanState === "scanning" && scanProgress === 0) {
+      if (isRecoveringGlobalScan.current) {
+        isRecoveringGlobalScan.current = false;
+        triggerCodeScan();
+      } else if (isRecoveringSingleScan.current && activeFile) {
+        isRecoveringSingleScan.current = false;
+        triggerSingleFileScan();
+      }
+    }
+  }, [scanState, loadedFiles, activeFileIndex]);
+
+  // Save session state on change
+  useEffect(() => {
+    if (loadedFiles.length === 0 && scanState === "idle") return; // Don't save empty initial state
+    fetch('/local-api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        loadedFiles,
+        activeFileIndex,
+        scanState,
+        vulnerabilities,
+        scanMode,
+        scanMessage,
+        isSingleScanActive
+      })
+    }).catch(err => console.error("Failed to save session", err));
+  }, [loadedFiles, activeFileIndex, scanState, vulnerabilities, scanMode, scanMessage, isSingleScanActive]);
 
   // Drag-and-drop overrides
   const handleDragOver = (e: React.DragEvent) => {
@@ -215,6 +317,17 @@ export default function App() {
       setScanState("idle");
       setVulnerabilities([]);
       setSelectedVulnerabilityId(null);
+
+      // Determine dropped name based on common path or single file
+      let droppedName = "Unknown";
+      if (files.length === 1) {
+        droppedName = files[0].name;
+      } else if (files[0].webkitRelativePath) {
+        droppedName = files[0].webkitRelativePath.split('/')[0];
+      } else {
+        droppedName = `${files.length} Files Loaded`;
+      }
+      setDroppedItemName(droppedName);
     } else {
       alert("No Java source files (.java) detected in the uploaded list.");
     }
@@ -254,6 +367,7 @@ export default function App() {
     setScanState("idle");
     setVulnerabilities([]);
     setSelectedVulnerabilityId(null);
+    setDroppedItemName(newFile.name);
   };
 
   // Perform full Code Security Scan
@@ -261,6 +375,7 @@ export default function App() {
     if (loadedFiles.length === 0) return;
 
     setScanState("scanning");
+    setIsSingleScanActive(false);
     setScanProgress(5);
     setScanProgressText("Initializing security context...");
 
@@ -296,10 +411,15 @@ export default function App() {
       const data = await response.json();
       
       setTimeout(() => {
-        setVulnerabilities(data.vulnerabilities || []);
+        const vulnsWithIds = (data.vulnerabilities || []).map((v: Vulnerability, idx: number) => ({
+          ...v,
+          id: v.id || `vuln-${Date.now()}-${idx}-${Math.random().toString(36).substring(7)}`
+        }));
+        setVulnerabilities(vulnsWithIds);
+
         // Setup state map of vulnerabilities
         const stateMap: Record<string, "idle" | "fixing" | "diff_ready" | "approved"> = {};
-        (data.vulnerabilities || []).forEach((v: Vulnerability) => {
+        vulnsWithIds.forEach((v: Vulnerability) => {
           stateMap[v.id] = v.remediatedSnippet ? "diff_ready" : "idle";
         });
         setRemediatingIdState(stateMap);
@@ -307,6 +427,15 @@ export default function App() {
         setScanMode(data.mode || "local_heuristics");
         setScanMessage(data.message || "");
         setScanState("completed");
+        
+        // Save to History
+        setScanHistory(prev => [{
+          id: Date.now().toString(),
+          timestamp: new Date(),
+          mode: data.mode || "local_heuristics",
+          files: [...loadedFiles],
+          vulnerabilities: vulnsWithIds
+        }, ...prev]);
       }, 300);
 
     } catch (err: any) {
@@ -315,6 +444,83 @@ export default function App() {
       setScanProgressText("API Interface failed. Starting local scanner...");
       
       // Secondary fallback
+      setTimeout(() => {
+        setScanState("idle");
+        alert("Server communication error. Please ensure the backend dev server is active and running.");
+      }, 1000);
+    }
+  };
+
+  // Perform Single File Scan
+  const triggerSingleFileScan = async () => {
+    if (!activeFile) return;
+
+    setScanState("scanning");
+    setIsSingleScanActive(true);
+    setScanProgress(5);
+    setScanProgressText(`Initializing scan for ${activeFile.name}...`);
+
+    const steps = [
+      { prg: 20, text: "Generating AST representation models..." },
+      { prg: 45, text: "Tracing data tainted parameters..." },
+      { prg: 70, text: "Cross-referencing OWASP rulesets..." },
+      { prg: 88, text: "Verifying cryptographic strength limits..." },
+      { prg: 95, text: "Assembling vulnerability matrix maps..." }
+    ];
+
+    let currentStep = 0;
+    const interval = setInterval(() => {
+      if (currentStep < steps.length) {
+        setScanProgress(steps[currentStep].prg);
+        setScanProgressText(steps[currentStep].text);
+        currentStep++;
+      }
+    }, 550);
+
+    try {
+      const response = await fetch("/api/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files: [activeFile] })
+      });
+
+      clearInterval(interval);
+      setScanProgress(100);
+      setScanProgressText("Audit compilation finalized!");
+
+      const data = await response.json();
+      
+      setTimeout(() => {
+        const vulnsWithIds = (data.vulnerabilities || []).map((v: Vulnerability, idx: number) => ({
+          ...v,
+          id: v.id || `vuln-${Date.now()}-${idx}-${Math.random().toString(36).substring(7)}`
+        }));
+        setVulnerabilities(vulnsWithIds);
+
+        const stateMap: Record<string, "idle" | "fixing" | "diff_ready" | "approved"> = {};
+        vulnsWithIds.forEach((v: Vulnerability) => {
+          stateMap[v.id] = v.remediatedSnippet ? "diff_ready" : "idle";
+        });
+        setRemediatingIdState(stateMap);
+
+        setScanMode(data.mode || "local_heuristics");
+        setScanMessage(data.message || "");
+        setScanState("completed");
+
+        setScanHistory(prev => [{
+          id: Date.now().toString(),
+          timestamp: new Date(),
+          mode: data.mode || "local_heuristics",
+          files: [activeFile],
+          vulnerabilities: vulnsWithIds
+        }, ...prev]);
+      }, 300);
+
+    } catch (err: any) {
+      clearInterval(interval);
+      console.error("Scan attempt failed completely:", err);
+      setScanProgressText("API Interface failed.");
+      
       setTimeout(() => {
         setScanState("idle");
         alert("Server communication error. Please ensure the backend dev server is active and running.");
@@ -464,6 +670,21 @@ export default function App() {
     }
   };
 
+  // Action: Clear entire workspace
+  const handleClearWorkspace = () => {
+    setLoadedFiles([]);
+    setActiveFileIndex(0);
+    setVulnerabilities([]);
+    setScanState("idle");
+    setScanProgress(0);
+    setScanProgressText("");
+    setSelectedVulnerabilityId(null);
+    setDroppedItemName(null);
+    setScanMode("none");
+    setScanMessage("");
+    setIsSingleScanActive(false);
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-tr from-[#fbcfe8]/35 via-[#e6f4ea]/45 to-[#ccfbf1]/40 text-slate-800 font-sans p-4 md:p-6 selection:bg-emerald-500/20 selection:text-emerald-950 relative overflow-hidden">
       {/* Background colorful glassmorphic blur shapes with hints of green */}
@@ -522,7 +743,35 @@ export default function App() {
           </div>
         </header>
 
+        {/* MAIN NAVIGATION TABS */}
+        <div className="flex gap-2 border-b border-slate-200 pb-px">
+          <button
+            onClick={() => setActiveTab("scan")}
+            className={`px-6 py-3 text-sm font-bold transition-all rounded-t-xl ${
+              activeTab === "scan" 
+                ? "bg-white/60 text-emerald-700 border-t border-l border-r border-white/60 shadow-[0_-4px_6px_-2px_rgba(0,0,0,0.05)]" 
+                : "text-slate-500 hover:bg-white/40 hover:text-slate-700"
+            }`}
+          >
+            Scanner Workspace
+          </button>
+          <button
+            onClick={() => setActiveTab("history")}
+            className={`px-6 py-3 text-sm font-bold transition-all rounded-t-xl flex items-center gap-2 ${
+              activeTab === "history" 
+                ? "bg-white/60 text-indigo-700 border-t border-l border-r border-white/60 shadow-[0_-4px_6px_-2px_rgba(0,0,0,0.05)]" 
+                : "text-slate-500 hover:bg-white/40 hover:text-slate-700"
+            }`}
+          >
+            Scan History
+            {scanHistory.length > 0 && (
+              <span className="bg-indigo-100 text-indigo-700 text-[10px] px-2 py-0.5 rounded-full">{scanHistory.length}</span>
+            )}
+          </button>
+        </div>
+
         {/* WORKSPACE DIVIDER GRID */}
+        {activeTab === "scan" && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           
           {/* LEFT COLUMN: CONTROL & FINDINGS PANEL (7 COLS) */}
@@ -534,59 +783,7 @@ export default function App() {
                 <FolderOpen className="w-4 h-4 text-emerald-500" /> File & Project Selection
               </h2>
 
-              {/* Demo Projects Selector Bar */}
-              <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/60 space-y-2">
-                <label className="text-[10px] font-mono uppercase text-slate-400 font-bold block">Select Preset Demo Projects</label>
-                <div className="flex flex-wrap gap-2">
-                  {DEMO_PROJECTS.map((project, idx) => (
-                    <button
-                      key={project.name}
-                      onClick={() => handleSelectProject(idx)}
-                      className={`px-3 py-2.5 text-xs rounded-xl transition-all text-left flex-1 border ${
-                        selectedProjectIndex === idx && loadedFiles === project.files
-                          ? "bg-gradient-to-tr from-rose-50 to-indigo-50/70 text-indigo-750 border-indigo-300 font-bold shadow-sm"
-                          : "bg-white border-slate-200/80 text-slate-600 hover:text-slate-900 hover:bg-slate-50 hover:border-slate-300"
-                      }`}
-                    >
-                      <div className="font-extrabold block truncate text-slate-800">{project.name}</div>
-                      <div className="text-[10px] text-slate-400 font-medium mt-0.5 truncate">{project.files.length} Files</div>
-                    </button>
-                  ))}
-                  
-                  {/* Upload SandBox Button */}
-                  <button
-                    onClick={() => {
-                      setSandboxFileName("PaymentVerificationService.java");
-                      setSandboxCode(`package com.bank.auth;
 
-import java.sql.*;
-
-public class PaymentVerificationService {
-    // SECURITY RISK: Hardcoded root tokens and SQL dynamic statements
-    private static final String API_SECRET = "AI_STUDIO_TEST_TOKEN_2026_XYZ123";
-
-    public void processPaymentAndLog(String accountId, double amount, String notes) {
-        try {
-            Connection conn = DriverManager.getConnection("jdbc:postgresql://localhost/bankdb", "root", API_SECRET);
-            Statement stmt = conn.createStatement();
-            
-            // Highly vulnerable SQL string concatenation
-            String query = "UPDATE accounts SET balance = balance - " + amount + " WHERE customer_id = '" + accountId + "'";
-            stmt.executeUpdate(query);
-            System.out.println("Payment Processed securely for Account: " + accountId);
-        } catch (SQLException e) {
-            e.printStackTrace();
-        }
-    }
-}`);
-                      setIsSandboxOpen(true);
-                    }}
-                    className="px-4 py-2.5 text-xs bg-white border border-slate-200 hover:border-indigo-300/80 hover:bg-indigo-50/30 text-indigo-650 rounded-xl transition-all block text-center min-w-[120px] flex items-center justify-center gap-1.5 font-bold shadow-sm"
-                  >
-                    <Code2 className="w-3.5 h-3.5 text-indigo-500" /> Web Playground
-                  </button>
-                </div>
-              </div>
 
               {/* Advanced Drag & Drop / File selection area */}
               <div 
@@ -598,18 +795,32 @@ public class PaymentVerificationService {
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
-                onClick={() => fileInputRef.current?.click()}
               >
                 <div className="flex flex-col items-center gap-2">
                   <div className="p-3 bg-rose-50 text-rose-500 rounded-2xl border border-rose-100">
                     <FolderOpen className="w-6 h-6" />
                   </div>
                   <p className="text-xs text-slate-700 font-bold">
-                    Drag and Drop .java files or folder directories here
+                    {droppedItemName ? `Loaded: ${droppedItemName}` : "Drag and Drop .java files or folder directories here"}
                   </p>
-                  <p className="text-[10px] text-slate-400 font-medium">
-                    Or click to navigate system folder files. Supports selecting multiple java classes.
+                  <p className="text-[10px] text-slate-400 font-medium max-w-sm mx-auto">
+                    Supports selecting multiple java classes or entire project folders.
                   </p>
+                  
+                  <div className="flex gap-3 justify-center mt-2">
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+                      className="px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold hover:bg-slate-50 hover:border-slate-300 text-slate-600 shadow-sm transition-all flex items-center gap-1.5"
+                    >
+                      Select Files
+                    </button>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); folderInputRef.current?.click(); }}
+                      className="px-4 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold hover:bg-slate-50 hover:border-slate-300 text-slate-600 shadow-sm transition-all flex items-center gap-1.5"
+                    >
+                      Select Folder
+                    </button>
+                  </div>
                 </div>
 
                 {/* Hidden File Inputs */}
@@ -619,6 +830,13 @@ public class PaymentVerificationService {
                   onChange={handleFileChange} 
                   multiple 
                   accept=".java" 
+                  className="hidden" 
+                />
+                <input 
+                  type="file" 
+                  ref={folderInputRef} 
+                  onChange={handleFileChange} 
+                  webkitdirectory="true"
                   className="hidden" 
                 />
               </div>
@@ -631,25 +849,39 @@ public class PaymentVerificationService {
                 </div>
                 
                 {loadedFiles.length > 0 && (
-                  <button
-                    onClick={triggerCodeScan}
-                    disabled={scanState === "scanning"}
-                    className={`px-5 py-2.5 rounded-xl text-xs font-bold tracking-wide shadow-md transition-all flex items-center gap-2 ${
-                      scanState === "scanning"
-                        ? "bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300"
-                        : "bg-gradient-to-r from-rose-500 to-indigo-600 text-white hover:opacity-90 active:scale-95 cursor-pointer"
-                    }`}
-                  >
-                    {scanState === "scanning" ? (
-                      <>
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-rose-450" /> Evaluating AST...
-                      </>
-                    ) : (
-                      <>
-                        <Cpu className="w-3.5 h-3.5" /> Analyze Java Project
-                      </>
-                    )}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2 mt-2 sm:mt-0">
+                    <button
+                      onClick={handleClearWorkspace}
+                      disabled={scanState === "scanning"}
+                      className={`px-4 py-2.5 rounded-xl text-xs font-bold shadow-sm transition-all flex items-center gap-2 ${
+                        scanState === "scanning"
+                          ? "bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200"
+                          : "bg-white text-slate-600 hover:text-rose-600 hover:bg-rose-50 border border-slate-200"
+                      }`}
+                      title="Clear Workspace"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Clear Workspace
+                    </button>
+                    <button
+                      onClick={triggerCodeScan}
+                      disabled={scanState === "scanning"}
+                      className={`px-5 py-2.5 rounded-xl text-xs font-bold tracking-wide shadow-md transition-all flex items-center gap-2 ${
+                        scanState === "scanning"
+                          ? "bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300"
+                          : "bg-gradient-to-r from-rose-500 to-indigo-600 text-white hover:opacity-90 active:scale-95 cursor-pointer"
+                      }`}
+                    >
+                      {scanState === "scanning" ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-rose-450" /> Evaluating AST...
+                        </>
+                      ) : (
+                        <>
+                          <Cpu className="w-3.5 h-3.5" /> Analyze Java Project
+                        </>
+                      )}
+                    </button>
+                  </div>
                 )}
               </div>
 
@@ -812,6 +1044,12 @@ public class PaymentVerificationService {
                         onClick={() => handleVulnerabilityClick(v)}
                       >
                         {/* High priority attention bar */}
+                        {/* File Path Header Over the Card */}
+                        <div className="bg-slate-800 text-slate-200 text-[10px] font-mono px-4 py-1.5 font-bold truncate w-full flex items-center gap-2">
+                          <FileCode className="w-3.5 h-3.5 text-emerald-400" />
+                          {v.filePath}
+                        </div>
+                        {/* High priority attention bar */}
                         <div className={`h-1.5 w-full ${
                           isApproved 
                             ? "bg-emerald-500" 
@@ -826,7 +1064,7 @@ public class PaymentVerificationService {
                           
                           {/* Top Tag Header */}
                           <div className="flex flex-wrap justify-between items-center gap-2">
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
                               {/* Severity Badge */}
                               <span className={`text-[10px] uppercase tracking-wider font-bold px-2.5 py-0.5 rounded-full ${
                                 isApproved
@@ -841,27 +1079,42 @@ public class PaymentVerificationService {
                               </span>
 
                               <span className="text-xs font-bold text-slate-800 font-sans">
-                                {v.type}
+                                {v.cwe_name || v.type}
                               </span>
+                              
+                              {v.cwe_id && (
+                                <span className="text-[10px] bg-slate-100 border border-slate-200 px-2 py-0.5 rounded text-slate-600 font-mono">
+                                  {v.cwe_id}
+                                </span>
+                              )}
+                              {v.confidence && (
+                                <span className="text-[10px] bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded text-indigo-600 font-mono">
+                                  Conf: {(v.confidence * 100).toFixed(1)}%
+                                </span>
+                              )}
                             </div>
 
                             {/* Line Number indicator */}
                             <span className="font-mono text-[9px] text-slate-500 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200/80 font-bold col-span-2">
-                              {v.filePath.split("/").pop()}:{v.lineNumber}
+                              Line: {v.location?.line || v.lineNumber}
                             </span>
                           </div>
 
                           {/* Vulnerability Description exploration */}
-                          <p className="text-xs text-slate-600 leading-relaxed font-semibold">
-                            {v.description}
-                          </p>
-
-                          {/* Code Snippet displaying before state */}
-                          <div className="space-y-1.5">
-                            <label className="text-[9px] font-mono text-slate-400 uppercase block tracking-wider font-bold">Vulnerable Source Code Segment</label>
-                            <div className="font-mono text-xs bg-rose-950/5 p-3 rounded-2xl border border-rose-100/60 text-rose-900 overflow-x-auto select-all max-w-full whitespace-pre break-all font-bold">
-                              {v.snippet}
-                            </div>
+                          <div className="space-y-2">
+                            <p className="text-xs text-slate-600 leading-relaxed font-semibold">
+                              {v.description}
+                            </p>
+                            {v.impact && (
+                              <p className="text-[11px] text-rose-700/80 leading-relaxed font-medium bg-rose-50 p-2 rounded-lg border border-rose-100">
+                                <strong>Impact:</strong> {v.impact}
+                              </p>
+                            )}
+                            {v.recommendation && (
+                              <p className="text-[11px] text-emerald-700/80 leading-relaxed font-medium bg-emerald-50 p-2 rounded-lg border border-emerald-100">
+                                <strong>Recommendation:</strong> {v.recommendation}
+                              </p>
+                            )}
                           </div>
 
                           {/* ACTION TOOLBAR */}
@@ -890,16 +1143,6 @@ public class PaymentVerificationService {
                                   Ignore
                                 </button>
 
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleRemoveVulnerability(v.id);
-                                  }}
-                                  className="px-2.5 py-2 bg-white hover:bg-slate-50 border border-slate-200 hover:text-slate-700 text-slate-400 text-xs rounded-xl transition-all font-semibold shadow-sm"
-                                  title="Dismiss altogether"
-                                >
-                                  Not a vuln
-                                </button>
                               </div>
                             )}
 
@@ -1123,19 +1366,138 @@ public class PaymentVerificationService {
             </div>
 
             {/* Interactive User documentation prompt block */}
-            <div className="mt-4 shrink-0 bg-emerald-50/40 p-3.5 rounded-2xl border border-emerald-100/60 text-xs text-slate-500 flex gap-2">
-              <KeyRound className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-              <div className="space-y-0.5">
-                <span className="font-extrabold text-slate-750">Auditor LLM Engine Credentials</span>
-                <p className="leading-relaxed font-semibold text-[11px] text-emerald-600/80">
-                  Advanced reasoning works seamlessly via your secure Gemini API secrets. Add your key inside the <strong className="text-emerald-750 font-bold">Settings &gt; Secrets</strong> dashboard panel to unlock complete sandbox parsing.
-                </p>
-              </div>
+            <div className="mt-4 shrink-0 flex gap-2">
+              <button
+                onClick={triggerSingleFileScan}
+                disabled={!activeFile || scanState === "scanning"}
+                className={`w-full py-3 rounded-2xl text-xs font-bold tracking-wide shadow-md transition-all flex items-center justify-center gap-2 ${
+                  !activeFile || scanState === "scanning"
+                    ? "bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300"
+                    : "bg-emerald-500 hover:bg-emerald-600 text-white shadow-emerald-500/20 active:scale-95 cursor-pointer"
+                }`}
+              >
+                {scanState === "scanning" ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin text-white" /> Scanning active file...
+                  </>
+                ) : (
+                  <>
+                    <Cpu className="w-4 h-4" /> Run Scan on Selected File
+                  </>
+                )}
+              </button>
             </div>
 
           </section>
 
         </div>
+        )}
+
+        {/* HISTORY TAB VIEW */}
+        {activeTab === "history" && (
+          <div className="border border-white/60 bg-white/50 p-6 rounded-3xl space-y-4 backdrop-blur-md shadow-xl shadow-slate-200/20">
+            <h2 className="text-sm font-bold tracking-wider text-slate-600 uppercase flex items-center gap-2">
+              <RefreshCw className="w-5 h-5 text-indigo-500" /> Session Scan History
+            </h2>
+            
+            {scanHistory.length === 0 ? (
+              <div className="text-center p-12 text-slate-400 font-medium border border-dashed border-slate-300 rounded-2xl">
+                No scans have been performed yet in this session.
+              </div>
+            ) : (
+              <div className="space-y-6">
+                {scanHistory.map((historyItem) => (
+                  <div key={historyItem.id} className="bg-white/80 p-5 rounded-2xl border border-slate-200 shadow-sm relative group">
+                    <button 
+                      onClick={() => setScanHistory(prev => prev.filter(h => h.id !== historyItem.id))}
+                      className="absolute top-4 right-4 text-slate-300 hover:text-rose-500 transition-colors opacity-0 group-hover:opacity-100"
+                      title="Remove from history"
+                    >
+                      <XCircle className="w-5 h-5" />
+                    </button>
+                    
+                    <div className="flex justify-between items-start mb-4">
+                      <div>
+                        <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">
+                          {historyItem.timestamp.toLocaleTimeString()}
+                        </div>
+                        <h3 className="font-bold text-slate-800">
+                          {historyItem.files.length} File(s) Scanned
+                        </h3>
+                      </div>
+                      <div className="flex gap-2">
+                        <span className="text-[10px] bg-slate-100 text-slate-600 border border-slate-200 px-2 py-1 rounded font-mono font-bold">
+                          {historyItem.mode}
+                        </span>
+                        <span className={`text-[10px] px-2 py-1 rounded font-mono font-bold ${
+                          historyItem.vulnerabilities.length > 0 ? "bg-rose-100 text-rose-700 border border-rose-200" : "bg-emerald-100 text-emerald-700 border border-emerald-200"
+                        }`}>
+                          {historyItem.vulnerabilities.length} Threats Found
+                        </span>
+                      </div>
+                    </div>
+                    
+                    {historyItem.vulnerabilities.length > 0 && (
+                      <div className="bg-slate-50 rounded-xl p-4 border border-slate-100 space-y-3 mb-2">
+                        <h4 className="text-xs font-bold text-slate-600 uppercase">Findings Details:</h4>
+                        {Array.from(new Set(historyItem.vulnerabilities.map(v => v.filePath))).map((filePath, i) => {
+                          const fileVulns = historyItem.vulnerabilities.filter(v => v.filePath === filePath);
+                          const file = historyItem.files.find(f => f.path === filePath || f.name === filePath.split('/').pop());
+                          const fileId = `${historyItem.id}-${filePath}`;
+                          const isExpanded = expandedHistoryIds.includes(fileId);
+
+                          return (
+                            <div key={i} className="bg-white border border-slate-200 rounded-lg overflow-hidden shadow-sm">
+                              <div className="p-3 flex justify-between items-start border-b border-slate-100 bg-slate-50/50">
+                                <div>
+                                  <div className="font-bold text-xs text-slate-700 flex items-center gap-2 mb-2">
+                                    <FileCode className="w-3.5 h-3.5 text-slate-400" />
+                                    {filePath}
+                                  </div>
+                                  <div className="space-y-1.5">
+                                    {fileVulns.map((v, vIdx) => (
+                                      <div key={vIdx} className="text-[11px] font-mono text-slate-600 flex items-center gap-2">
+                                        <span className="w-2 h-2 rounded-full bg-rose-500 shrink-0" />
+                                        <span className="font-bold text-rose-600">{v.type}</span> at line {v.lineNumber}
+                                        {v.status === 'Approved' && <span className="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 rounded-full py-0.5 font-bold uppercase">Resolved</span>}
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                                <button
+                                  onClick={() => toggleHistoryExpanded(fileId)}
+                                  className="text-slate-400 hover:text-slate-700 transition-colors p-1.5 rounded-md hover:bg-slate-200 bg-white border border-slate-200 shadow-sm ml-2 mt-1 shrink-0"
+                                  title={isExpanded ? "Collapse Source Code" : "Expand Source Code"}
+                                >
+                                  {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                                </button>
+                              </div>
+
+                              {isExpanded && file && (
+                                <div className="bg-[#0f172a] p-4 overflow-auto max-h-[400px]">
+                                  <pre className="font-mono text-xs leading-relaxed text-slate-300">
+                                    {file.content.split('\n').map((line, lineIdx) => (
+                                      <div key={lineIdx} className="flex">
+                                        <span className="w-8 shrink-0 text-slate-600 select-none text-right pr-3">{lineIdx + 1}</span>
+                                        <span className="whitespace-pre break-all">
+                                          {renderHighlightedCode(line)}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </pre>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
       </div>
     </div>

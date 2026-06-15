@@ -6,17 +6,31 @@ export interface JavaFile {
 }
 
 export interface Vulnerability {
-  id: string;
-  type: string;
-  severity: 'High' | 'Medium' | 'Low';
+  id?: string; // id is sometimes missing from JSON
+  cwe_id?: string;
+  cwe_name?: string;
+  confidence?: number;
+  location?: { line: number };
+  impact?: string;
+  type?: string;
+  severity: string;
   filePath: string;
   lineNumber: number;
-  snippet: string;
+  snippet?: string;
   description: string;
   recommendation: string;
-  status: 'Scanned' | 'Fixing' | 'Diff Ready' | 'Approved' | 'Rejected' | 'Ignored';
+  status: string;
   remediatedSnippet?: string;
   remediationExplanation?: string;
+  fullRemediatedContent?: string;
+}
+
+export interface ScanHistoryEntry {
+  id: string;
+  timestamp: Date;
+  mode: string;
+  files: JavaFile[];
+  vulnerabilities: Vulnerability[];
 }
 
 export interface ProjectDemo {
