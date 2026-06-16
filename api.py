@@ -4,6 +4,7 @@ from pathlib import Path
 import logging
 import os
 import sys
+import concurrent.futures
 
 # Add backend directory to sys.path if not present to ensure inference_engine imports correctly
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -124,7 +125,7 @@ def scan_folder(request: ScanFolderRequest):
         
     all_vulnerabilities = []
     
-    for file_path in java_files:
+    def process_file(file_path):
         logger.info(f"Scanning file: {file_path}")
         try:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -140,6 +141,7 @@ def scan_folder(request: ScanFolderRequest):
             
             # Map findings
             vulns = report.get("vulnerabilities", [])
+            mapped_vulns = []
             for vuln in vulns:
                 # Add file context to vulnerability
                 vuln["filePath"] = str(file_path)
@@ -158,11 +160,17 @@ def scan_folder(request: ScanFolderRequest):
                     vuln["lineNumber"] = 1
                     
                 vuln["status"] = "Scanned"
-                
-                all_vulnerabilities.append(vuln)
-                
+                mapped_vulns.append(vuln)
+            return mapped_vulns
         except Exception as e:
             logger.error(f"Failed to scan file {file_path}: {e}")
+            return []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        results = executor.map(process_file, java_files)
+        
+    for res in results:
+        all_vulnerabilities.extend(res)
             
     return {"vulnerabilities": all_vulnerabilities}
 
@@ -228,7 +236,7 @@ def scan_contents(request: ScanRequest):
         
     all_vulnerabilities = []
     
-    for file_obj in request.files:
+    def process_file_content(file_obj):
         logger.info(f"Scanning provided content for: {file_obj.path}")
         try:
             file_line_count = len(file_obj.content.splitlines())
@@ -240,6 +248,7 @@ def scan_contents(request: ScanRequest):
             )
             
             vulns = report.get("vulnerabilities", [])
+            mapped_vulns = []
             for vuln in vulns:
                 vuln["filePath"] = file_obj.path
                 if "cwe_name" in vuln and "type" not in vuln:
@@ -254,10 +263,17 @@ def scan_contents(request: ScanRequest):
                     vuln["lineNumber"] = 1
                     
                 vuln["status"] = "Scanned"
-                all_vulnerabilities.append(vuln)
-                
+                mapped_vulns.append(vuln)
+            return mapped_vulns
         except Exception as e:
             logger.error(f"Failed to scan content for {file_obj.path}: {e}")
+            return []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        results = executor.map(process_file_content, request.files)
+        
+    for res in results:
+        all_vulnerabilities.extend(res)
             
     return {"vulnerabilities": all_vulnerabilities}
 
