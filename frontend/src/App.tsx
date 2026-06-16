@@ -558,7 +558,8 @@ export default function App() {
             remediatedSnippet: data.remediatedSnippet,
             remediationExplanation: data.remediationExplanation,
             // also keep track of what the full repaired file will look like
-            fullRemediatedContent: data.fullRemediatedContent
+            fullRemediatedContent: data.fullRemediatedContent,
+            snippet: v.snippet || fileToFix.content
           } as any;
         }
         return v;

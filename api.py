@@ -60,7 +60,7 @@ logger.info("Initializing FixInferenceEngine...")
 try:
     fix_engine = FixInferenceEngine(
         model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
-        adapter_path=None,  # Disabled adapters for fixed inference
+        adapter_path="./adapters_fix",
         load_in_4bit=False
     )
     logger.info("FixEngine loaded successfully.")

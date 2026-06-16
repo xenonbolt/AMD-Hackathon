@@ -83,9 +83,11 @@ class FixInferenceEngine:
             if self.adapter_path and Path(self.adapter_path).exists():
                 logger.info(f"Overlaying PEFT adapter from path: {self.adapter_path}")
                 self.model = PeftModel.from_pretrained(base_model, str(self.adapter_path))
+                self.using_adapter = True
             else:
                 logger.warning("No PEFT adapter specified or found. Running raw base model.")
                 self.model = base_model
+                self.using_adapter = False
 
             self.model.config.use_cache = True
             self.model.eval()
@@ -115,7 +117,15 @@ class FixInferenceEngine:
                 input_dict["cve_id"] = vulnerability["cve_id"]
                 
             input_json = json.dumps(input_dict, ensure_ascii=False)
-            prompt = PROMPT_TEMPLATE.format(input_json=input_json)
+            
+            if self.using_adapter:
+                prompt = PROMPT_TEMPLATE.format(input_json=input_json)
+            else:
+                messages = [
+                    {"role": "system", "content": "You are an expert security engineer. Fix the vulnerability in the provided code. Output ONLY valid JSON containing an 'explanation' string and a 'fixed_code' string. No markdown formatting, just pure JSON."},
+                    {"role": "user", "content": f"Fix the vulnerability in the code:\n{input_json}"}
+                ]
+                prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
             inputs = self.tokenizer(prompt, return_tensors="pt")
             input_ids = inputs["input_ids"].to(self.model.device)
@@ -213,7 +223,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run the Remediation Engine locally.")
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-Coder-7B-Instruct", help="Base model ID.")
-    parser.add_argument("--adapter_path", type=str, default=None, help="Path to PEFT adapters. If not specified, runs base model only.")
+    parser.add_argument("--adapter_path", type=str, default="./adapters_fix", help="Path to PEFT adapters. If not specified, runs base model only.")
     parser.add_argument("--target_path", type=str, required=True, help="Path to the Java file to fix.")
     parser.add_argument("--cwe_id", type=str, default="CWE-89", help="The CWE ID of the vulnerability to fix (e.g., CWE-89).")
     parser.add_argument("--cwe_name", type=str, default="SQL Injection", help="The CWE Name.")
