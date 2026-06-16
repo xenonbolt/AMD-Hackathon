@@ -115,6 +115,10 @@ class FixInferenceEngine:
             }
             if "cve_id" in vulnerability:
                 input_dict["cve_id"] = vulnerability["cve_id"]
+            if "lineNumber" in vulnerability:
+                input_dict["line_number"] = vulnerability["lineNumber"]
+            elif "line_number" in vulnerability:
+                input_dict["line_number"] = vulnerability["line_number"]
                 
             input_json = json.dumps(input_dict, ensure_ascii=False)
             
@@ -227,6 +231,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_path", type=str, required=True, help="Path to the Java file to fix.")
     parser.add_argument("--cwe_id", type=str, default="CWE-89", help="The CWE ID of the vulnerability to fix (e.g., CWE-89).")
     parser.add_argument("--cwe_name", type=str, default="SQL Injection", help="The CWE Name.")
+    parser.add_argument("--line_number", type=int, default=None, help="The line number of the vulnerability.")
     parser.add_argument("--no_quant", action="store_true", help="Disable 4-bit quantization.")
     
     args = parser.parse_args()
@@ -253,6 +258,8 @@ if __name__ == "__main__":
         "cwe_id": args.cwe_id,
         "cwe_name": args.cwe_name
     }
+    if args.line_number is not None:
+        vulnerability_details["lineNumber"] = args.line_number
 
     print(f"\nAnalyzing {args.target_path} for {args.cwe_id}...")
     result = engine.remediate_file_content(raw_code, vulnerability_details)
