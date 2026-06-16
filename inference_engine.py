@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger("inference_engine")
 
 PROMPT_TEMPLATE = (
-    "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. Return structured JSON only.\n\n"
+    "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. Return structured JSON only in English.\n\n"
     "<|input|>\n{raw_code}\n\n"
     "<|response|>\n"
 )
@@ -30,8 +30,10 @@ PROMPT_TEMPLATE = (
 PROMPT_TEMPLATE = (
     "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. "
     "Return structured JSON ONLY inside a top-level \"vulnerabilities\" array. "
+    "All fields in the JSON response, including 'cwe_name', 'description', 'impact', and 'recommendation', "
+    "must be written in English. "
     "For each vulnerability, ensure the 'description' field contains a concise (2-3 sentences) "
-    "but technically precise explanation of the exploit, referencing specific variables and method names. "
+    "but technically precise explanation of the exploit in English, referencing specific variables and method names. "
     "Keep explanations brief and direct to optimize response time.\n\n"
     "<|input|>\n{raw_code}\n\n"
     "<|response|>\n"
@@ -533,6 +535,36 @@ class VulnerabilityInferenceEngine:
         return None, None
 
     @staticmethod
+    def _translate_to_english(text: str) -> str:
+        """
+        Translates text to English using deep-translator or translate package if installed.
+        Safely falls back to the original text on any failure.
+        """
+        if not text or not isinstance(text, str):
+            return text
+            
+        # 1. Try deep-translator (GoogleTranslator)
+        try:
+            from deep_translator import GoogleTranslator
+            translated = GoogleTranslator(source='auto', target='en').translate(text)
+            if translated:
+                return translated
+        except Exception:
+            pass
+            
+        # 2. Try translate package (Translator)
+        try:
+            from translate import Translator
+            translator = Translator(to_lang="en")
+            translated = translator.translate(text)
+            if translated:
+                return translated
+        except Exception:
+            pass
+            
+        return text
+
+    @staticmethod
     def _validate_vulnerabilities(
         vulns: List[Dict[str, Any]],
         file_line_count: Optional[int] = None,
@@ -563,6 +595,11 @@ class VulnerabilityInferenceEngine:
                 dropped += 1
                 continue
 
+            # Translate text fields to English if they are in another language (e.g. French)
+            for field in ["cwe_name", "description", "impact", "recommendation", "type"]:
+                if vuln.get(field) and isinstance(vuln[field], str):
+                    vuln[field] = VulnerabilityInferenceEngine._translate_to_english(vuln[field])
+
             # Fill in defaults for missing cwe fields instead of dropping the entry.
             # The model may produce valid findings with slightly different key names.
             if not vuln.get("cwe_id") and not vuln.get("cwe_name"):
@@ -578,8 +615,10 @@ class VulnerabilityInferenceEngine:
 
             # Properly infer CWE using our generalized heuristics and keyword mapping
             # Always run inference to fix hallucinated mappings (e.g. CWE-22 for Command Injection)
-            old_id = vuln.get("cwe_id", "")
-            old_name = vuln.get("cwe_name", "")
+            old_id = vuln.get("cwe_id")
+            old_id = str(old_id) if old_id is not None else ""
+            old_name = vuln.get("cwe_name")
+            old_name = str(old_name) if old_name is not None else ""
             
             inferred_id, inferred_name = VulnerabilityInferenceEngine._infer_cwe(vuln, code_content)
             if inferred_id:

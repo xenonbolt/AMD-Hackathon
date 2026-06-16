@@ -9,6 +9,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from inference_engine import VulnerabilityInferenceEngine
+from fix_engine import FixInferenceEngine
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,7 +46,7 @@ logger.info("Initializing VulnerabilityInferenceEngine...")
 try:
     engine = VulnerabilityInferenceEngine(
         model_id="deepseek-ai/deepseek-coder-6.7b-base",
-        adapter_path="./adapters",
+        adapter_path=None,  # Disabled adapters to match raw base model console output
         load_in_4bit=False  # No quant as requested
     )
     logger.info("Engine loaded successfully.")
@@ -53,6 +54,18 @@ except Exception as e:
     logger.error(f"Failed to load engine: {e}")
     # We allow the app to start, but subsequent calls will fail if engine is not loaded
     engine = None
+
+logger.info("Initializing FixInferenceEngine...")
+try:
+    fix_engine = FixInferenceEngine(
+        model_id="Qwen/Qwen3-Coder-Next",
+        adapter_path="./adapters_fix",
+        load_in_4bit=False
+    )
+    logger.info("FixEngine loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load fix engine: {e}")
+    fix_engine = None
 
 
 class ScanFolderRequest(BaseModel):
@@ -71,9 +84,25 @@ class ScanRequest(BaseModel):
     files: list[FileContent]
 
 
+class RemediateRequest(BaseModel):
+    filePath: str
+    fileContent: str
+    vulnerability: dict
+
+
 @app.get("/api/health")
 def health_check():
     return {"status": "healthy", "engine_loaded": engine is not None}
+
+
+@app.get("/api/debug_prompt")
+def debug_prompt():
+    from inference_engine import PROMPT_TEMPLATE
+    return {
+        "prompt_template": PROMPT_TEMPLATE,
+        "adapters_loaded": engine.adapter_path if engine is not None else None,
+        "model_id": engine.model_id if engine is not None else None
+    }
 
 
 @app.post("/api/scan_folder")
@@ -232,3 +261,20 @@ def scan_contents(request: ScanRequest):
             
     return {"vulnerabilities": all_vulnerabilities}
 
+
+@app.post("/api/remediate")
+def remediate_vulnerability(request: RemediateRequest):
+    if fix_engine is None:
+        raise HTTPException(status_code=500, detail="Fix inference engine not loaded properly.")
+        
+    logger.info(f"Remediating vulnerability {request.vulnerability.get('cwe_id')} in {request.filePath}")
+    try:
+        report = fix_engine.remediate_file_content(
+            raw_code=request.fileContent,
+            vulnerability=request.vulnerability,
+            max_new_tokens=2048
+        )
+        return report
+    except Exception as e:
+        logger.error(f"Failed to remediate vulnerability: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to remediate: {e}")

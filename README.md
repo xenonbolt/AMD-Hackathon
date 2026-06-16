@@ -30,6 +30,12 @@ Implements an optimized inference pipeline combining the base model with the tra
 ### 4. `scanner.py`
 A static analysis tool that recursively walks directories to locate `.java` files, isolates logical code chunks (using brace matching for classes/methods or sliding windows), runs them through the inference engine, and compiles a structured JSON vulnerability report.
 
+### 5. `train_fix_model.py`
+A specialized script for fine-tuning the remediation model (defaulting to `Qwen/Qwen3-Coder-Next`) on `fixed.jsonl`. It generates LoRA adapters specific to fixing vulnerabilities.
+
+### 6. `fix_engine.py`
+Loads the remediation model and adapters (`adapters_fix`) to provide the `/api/remediate` endpoint logic for generating code fixes and explanations.
+
 ---
 
 ## Directory Structure
@@ -41,7 +47,9 @@ A static analysis tool that recursively walks directories to locate `.java` file
 ├── data_preparation.py      # Dataset loader and tokenization utilities
 ├── fine_tune.py             # QLoRA fine-tuning script
 ├── inference_engine.py      # Local inference pipeline (Base + LoRA)
-└── scanner.py               # Static scanner and reporter utility
+├── scanner.py               # Static scanner and reporter utility
+├── train_fix_model.py       # Training script for remediation model
+└── fix_engine.py            # Local inference pipeline for fixes
 ```
 
 ---
@@ -108,10 +116,22 @@ python scanner.py \
     --output_report "vulnerability_report.json"
 ```
 
+### 5. Train the Remediation Engine
+To fine-tune `Qwen/Qwen3-Coder-Next` on `fixed.jsonl` for the fix engine:
+```bash
+python train_fix_model.py \
+    --model_id "Qwen/Qwen3-Coder-Next" \
+    --dataset_path "Dataset/fixed.jsonl" \
+    --output_dir "./adapters_fix" \
+    --epochs 3 \
+    --batch_size 4
+```
+
 ---
 
 ## License & Safety Guidelines
 This tool is designed for **defensive application security testing** and **automated vulnerability remediation**. Use this tool responsibly on codebases you are authorized to analyze.
 
 
+jupyter server list
 $env:VITE_API_BASE="base/proxy/8000"; $env:VITE_JUPYTER_TOKEN="<token>"; npm run dev
