@@ -127,6 +127,16 @@ python train_fix_model.py \
     --batch_size 4
 ```
 
+### 6. Run the Remediation Engine Locally
+To generate a fix for a specific file without running the API server:
+```bash
+python fix_engine.py \
+    --target_path "sample.java" \
+    --cwe_id "CWE-89" \
+    --cwe_name "SQL Injection" \
+    --no_quant
+```
+
 ---
 
 ## License & Safety Guidelines

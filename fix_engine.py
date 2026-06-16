@@ -205,3 +205,55 @@ class FixInferenceEngine:
         except json.JSONDecodeError as e:
             logger.error(f"Failed to decode output JSON: {e}. Raw: {json_candidate}")
             return {}
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="Run the Remediation Engine locally.")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-Coder-Next", help="Base model ID.")
+    parser.add_argument("--adapter_path", type=str, default=None, help="Path to PEFT adapters. If not specified, runs base model only.")
+    parser.add_argument("--target_path", type=str, required=True, help="Path to the Java file to fix.")
+    parser.add_argument("--cwe_id", type=str, default="CWE-89", help="The CWE ID of the vulnerability to fix (e.g., CWE-89).")
+    parser.add_argument("--cwe_name", type=str, default="SQL Injection", help="The CWE Name.")
+    parser.add_argument("--no_quant", action="store_true", help="Disable 4-bit quantization.")
+    
+    args = parser.parse_args()
+
+    if not Path(args.target_path).exists():
+        print(f"Error: Target file {args.target_path} does not exist.")
+        sys.exit(1)
+
+    print(f"Loading FixEngine with model={args.model_id}, adapter={args.adapter_path}, quant={not args.no_quant}")
+    try:
+        engine = FixInferenceEngine(
+            model_id=args.model_id,
+            adapter_path=args.adapter_path,
+            load_in_4bit=not args.no_quant
+        )
+    except Exception as e:
+        print(f"Failed to load engine: {e}")
+        sys.exit(1)
+
+    with open(args.target_path, "r", encoding="utf-8") as f:
+        raw_code = f.read()
+
+    vulnerability_details = {
+        "cwe_id": args.cwe_id,
+        "cwe_name": args.cwe_name
+    }
+
+    print(f"\nAnalyzing {args.target_path} for {args.cwe_id}...")
+    result = engine.remediate_file_content(raw_code, vulnerability_details)
+    
+    print("\n" + "="*50)
+    print("REMEDIATION EXPLANATION:")
+    print("="*50)
+    print(result.get("remediationExplanation", "No explanation."))
+    
+    print("\n" + "="*50)
+    print("FIXED CODE:")
+    print("="*50)
+    print(result.get("fullRemediatedContent", "No fixed code."))
+    print("="*50 + "\n")
