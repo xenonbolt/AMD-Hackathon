@@ -305,7 +305,8 @@ def run_training(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="QLoRA Fine-Tuning Script for Fix Engine")
-    parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-Coder-Next", help="Base model identifier")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-Coder-7B-Instruct",
+                        help="HuggingFace model ID (e.g. Qwen/Qwen2.5-Coder-7B-Instruct)")
     parser.add_argument("--dataset_path", type=str, default="Dataset/fixed.jsonl", help="Path to training JSONL dataset")
     parser.add_argument("--output_dir", type=str, default="./adapters_fix", help="Output directory for saved adapters")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")

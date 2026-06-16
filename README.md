@@ -120,7 +120,7 @@ python scanner.py \
 To fine-tune `Qwen/Qwen3-Coder-Next` on `fixed.jsonl` for the fix engine:
 ```bash
 python train_fix_model.py \
-    --model_id "Qwen/Qwen3-Coder-Next" \
+    --model_id "Qwen/Qwen2.5-Coder-7B-Instruct" \
     --dataset_path "Dataset/fixed.jsonl" \
     --output_dir "./adapters_fix" \
     --epochs 3 \

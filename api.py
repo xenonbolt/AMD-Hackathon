@@ -59,7 +59,7 @@ except Exception as e:
 logger.info("Initializing FixInferenceEngine...")
 try:
     fix_engine = FixInferenceEngine(
-        model_id="Qwen/Qwen3-Coder-Next",
+        model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
         adapter_path=None,  # Disabled adapters for fixed inference
         load_in_4bit=False
     )

@@ -31,7 +31,7 @@ class FixInferenceEngine:
     """
     def __init__(
         self,
-        model_id: str = "Qwen/Qwen3-Coder-Next",
+        model_id: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
         adapter_path: Optional[Union[str, Path]] = "./adapters_fix",
         load_in_4bit: bool = True
     ) -> None:
@@ -212,7 +212,7 @@ if __name__ == "__main__":
     import sys
 
     parser = argparse.ArgumentParser(description="Run the Remediation Engine locally.")
-    parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-Coder-Next", help="Base model ID.")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-Coder-7B-Instruct", help="Base model ID.")
     parser.add_argument("--adapter_path", type=str, default=None, help="Path to PEFT adapters. If not specified, runs base model only.")
     parser.add_argument("--target_path", type=str, required=True, help="Path to the Java file to fix.")
     parser.add_argument("--cwe_id", type=str, default="CWE-89", help="The CWE ID of the vulnerability to fix (e.g., CWE-89).")
