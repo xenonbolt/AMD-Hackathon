@@ -119,6 +119,10 @@ class FixInferenceEngine:
                 input_dict["line_number"] = vulnerability["lineNumber"]
             elif "line_number" in vulnerability:
                 input_dict["line_number"] = vulnerability["line_number"]
+            
+            for key in ["description", "context", "impact", "recommendation"]:
+                if key in vulnerability and vulnerability[key]:
+                    input_dict[key] = vulnerability[key]
                 
             input_json = json.dumps(input_dict, ensure_ascii=False)
             
@@ -126,7 +130,7 @@ class FixInferenceEngine:
                 prompt = PROMPT_TEMPLATE.format(input_json=input_json)
             else:
                 messages = [
-                    {"role": "system", "content": "You are an expert security engineer. Fix the vulnerability in the provided code. Output ONLY valid JSON containing an 'explanation' string and a 'fixed_code' string. No markdown formatting, just pure JSON."},
+                    {"role": "system", "content": "You are an expert security engineer. Fix the vulnerability in the provided code. Output ONLY valid JSON containing an 'explanation' string and a 'fixed_code' string. The 'fixed_code' MUST contain the ENTIRE completely updated Java file. Do not output only a snippet. CRITICAL SECURITY RULE: When fixing Command Injection (CWE-78), NEVER use shell interpreters like 'sh -c' or 'bash -c' with concatenated variables. You MUST pass the executable and all arguments as separate array elements to ProcessBuilder (e.g., new ProcessBuilder(\"ping\", \"-c\", \"1\", userInput)). No markdown formatting, just pure JSON."},
                     {"role": "user", "content": f"Fix the vulnerability in the code:\n{input_json}"}
                 ]
                 prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
