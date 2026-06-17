@@ -2,21 +2,46 @@
 
 ## Architecture Diagram
 
-`mermaid
-graph TD
-    Client[React Frontend] -->|HTTP POST /api/scan| API[FastAPI Backend - api.py]
-    Client -->|HTTP POST /api/remediate| API
-    
-    API -->|Analyze Code| ScanEngine[VulnerabilityInferenceEngine - inference_engine.py]
-    API -->|Remediate Code| FixEngine[FixInferenceEngine - fix_engine.py]
-    
-    ScanEngine -->|Load Weights + Adapter| DeepSeek[DeepSeek Coder 6.7B Instruct + LoRA]
-    FixEngine -->|Load Weights + Adapter| Qwen[Qwen 2.5 Coder 7B Instruct + LoRA]
-    
-    DataPrep[generate_production_data.py] -->|JSONL Datasets| FineTuning[fine_tune.py / train_fix_model.py]
-    FineTuning -->|Train LoRA| DeepSeek
-    FineTuning -->|Train LoRA| Qwen
-`
+```text
++-----------------------------------------------------------------------------------+
+|                                 REACT FRONTEND                                    |
+|   (Sends Source Code / Requests Fixes)                                            |
++-----------------------------------------------------------------------------------+
+                               |                   |
+                     POST /api/scan         POST /api/remediate
+                               |                   |
+                               v                   v
++-----------------------------------------------------------------------------------+
+|                               FASTAPI BACKEND                                     |
+|                                  (api.py)                                         |
++-----------------------------------------------------------------------------------+
+                               |                   |
+                      (Triggers Analysis)   (Triggers Remediation)
+                               |                   |
+                               v                   v
++---------------------------------------+ +---------------------------------------+
+|    VulnerabilityInferenceEngine       | |         FixInferenceEngine            |
+|        (inference_engine.py)          | |          (fix_engine.py)              |
++---------------------------------------+ +---------------------------------------+
+                               |                   |
+                    (Loads Base+Adapter)  (Loads Base+Adapter)
+                               |                   |
+                               v                   v
++---------------------------------------+ +---------------------------------------+
+|       DeepSeek Coder 6.7B Instruct    | |      Qwen 2.5 Coder 7B Instruct       |
+|             (+ LoRA Adapter)          | |           (+ LoRA Adapter)            |
++---------------------------------------+ +---------------------------------------+
+                               ^                   ^
+                               |                   |
+                         (Fine-Tuning Process)     |
+                      (fine_tune.py / train_fix_model.py)
+                               |
+                   +-----------------------+
+                   |   JSONL Datasets      |
+                   | (generate_production_ |
+                   |       data.py)        |
+                   +-----------------------+
+```
 
 ## Source Code
 
