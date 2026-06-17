@@ -43,9 +43,9 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing VulnerabilityInferenceEngine...")
     try:
         engine = VulnerabilityInferenceEngine(
-            model_id="deepseek-ai/deepseek-coder-6.7b-base",
+            model_id="deepseek-ai/deepseek-coder-6.7b-instruct",
             adapter_path="./adapters",
-            load_in_4bit=False  # No quant as requested
+            load_in_4bit=False  # BitsAndBytes 4-bit incompatible with ROCm/AMD GPU
         )
         logger.info("Engine loaded successfully.")
     except Exception as e:
@@ -402,6 +402,6 @@ def get_telemetry() -> Dict[str, Any]:
         "ram_usage": ram_usage_gb,
         "gpu_name": gpu_name,
         "gpu_type": gpu_type,
-        "models_loaded": ["Qwen/Qwen2.5-Coder-7B-Instruct", "adapters_fix"],
+        "models_loaded": ["DeepSeek-Coder-6.7B-Instruct (Vuln Scanner)", "Qwen2.5-Coder-7B-Instruct (Fix Engine)"],
         "api_health": "Online (FastAPI / 0.0.0.0:8000)"
     }

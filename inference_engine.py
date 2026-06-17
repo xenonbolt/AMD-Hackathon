@@ -22,33 +22,12 @@ logging.basicConfig(
 logger = logging.getLogger("inference_engine")
 
 PROMPT_TEMPLATE = (
-    "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. "
-    "Return structured JSON ONLY inside a top-level \"vulnerabilities\" array. "
-    "You MUST write your ENTIRE response strictly in English. "
-    "For each vulnerability, provide: cwe_id, cwe_name, severity (critical/high/medium/low), "
-    "confidence (0.0-1.0), location (with line number), description (2-3 sentences referencing "
-    "specific variables and method names), impact, and recommendation. "
-    "Keep explanations brief and direct.\n\n"
-    "EXAMPLE OUTPUT FORMAT:\n"
-    "```json\n"
-    "{\n"
-    "  \"vulnerabilities\": [\n"
-    "    {\n"
-    "      \"cwe_id\": \"CWE-89\",\n"
-    "      \"cwe_name\": \"SQL Injection\",\n"
-    "      \"severity\": \"high\",\n"
-    "      \"confidence\": 0.95,\n"
-    "      \"location\": {\"line\": 15},\n"
-    "      \"description\": \"User input from getParameter() is concatenated into the SQL query string passed to executeQuery() without sanitization, enabling SQL injection.\",\n"
-    "      \"impact\": \"An attacker can read, modify, or delete arbitrary database records.\",\n"
-    "      \"recommendation\": \"Use PreparedStatement with parameterized queries instead of string concatenation.\"\n"
-    "    }\n"
-    "  ]\n"
-    "}\n"
-    "```\n\n"
+    "<|instruction|>\n"
+    "Analyze the Java code and identify ALL security vulnerabilities. Return structured JSON only.\n\n"
     "<|input|>\n{raw_code}\n\n"
     "<|response|>\n"
 )
+
 
 
 class VulnerabilityInferenceEngine:
@@ -176,13 +155,14 @@ class VulnerabilityInferenceEngine:
         generation_configs = [
             {  # Attempt 1: Greedy with repetition penalty
                 "do_sample": False,
-                "repetition_penalty": 1.2,
+                "repetition_penalty": 1.3,
             },
             {  # Attempt 2: Sampling fallback (different token distribution)
                 "do_sample": True,
-                "temperature": 0.3,
-                "top_p": 0.9,
-                "repetition_penalty": 1.15,
+                "temperature": 0.4,
+                "top_p": 0.85,
+                "top_k": 50,
+                "repetition_penalty": 1.25,
             },
         ]
 
@@ -197,17 +177,24 @@ class VulnerabilityInferenceEngine:
                 input_ids = inputs["input_ids"].to(self.model.device)
                 attention_mask = inputs["attention_mask"].to(self.model.device)
 
-                # 2. Run generation
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        max_new_tokens=max_new_tokens,
-                        use_cache=True,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        **gen_config
-                    )
+                # 2. Run generation (wrapped to catch GPU/ROCm crashes)
+                try:
+                    with torch.no_grad():
+                        outputs = self.model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            max_new_tokens=max_new_tokens,
+                            use_cache=True,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            **gen_config
+                        )
+                except RuntimeError as gpu_err:
+                    logger.error(f"GPU error during generation attempt {attempt_idx}: {gpu_err}")
+                    if attempt_idx < len(generation_configs):
+                        logger.warning(f"Skipping to next generation config...")
+                        continue
+                    return {"vulnerabilities": [], "error": f"GPU generation failed: {str(gpu_err)}"}
 
                 # 3. Extract and decode ONLY the generated tokens
                 generated_tokens = outputs[0][len(input_ids[0]):]
@@ -247,6 +234,7 @@ class VulnerabilityInferenceEngine:
                 }
 
         return last_error or {"vulnerabilities": [], "error": "All inference attempts failed"}
+
 
     def _sanitize_repetition(self, text: str) -> str:
         """
@@ -733,7 +721,7 @@ class VulnerabilityInferenceEngine:
             confidence_score = conf_val * 40.0
 
             # Component 2: Sink Validation Component (Max 40 points)
-            sink_score = 20.0  # Default neutral score if no heuristic exists
+            sink_score = 20.0  # Default neutral score if no heuristic exists for this CWE
             sink_found = False
             
             if code_content and vuln.get("cwe_id"):
@@ -741,7 +729,7 @@ class VulnerabilityInferenceEngine:
                 sink_heuristics = {
                     "CWE-78": r"(Runtime\.getRuntime\(\)\.exec\(|new ProcessBuilder\(|ProcessBuilder\()",
                     "CWE-20": r"(Runtime\.getRuntime\(\)\.exec\(|new ProcessBuilder\(|ProcessBuilder\()",
-                    "CWE-22": r"(\bFile\b|\bFileInputStream\b|\bFileOutputStream\b|\bFileReader\b|\bFileWriter\b|\bPaths\.get\b|\bFiles\.read\b|\bFiles\.write\b|\bMultipartFile\b|\bInputStream\b|\bOutputStream\b)",
+                    "CWE-22": r"(\bFile\b|\\bFileInputStream\b|\bFileOutputStream\b|\bFileReader\b|\bFileWriter\b|\bPaths\.get\b|\bFiles\.read\b|\bFiles\.write\b|\bMultipartFile\b|\bInputStream\b|\bOutputStream\b)",
                     "CWE-276": r"(new File\(|new FileReader\(|createTempFile\(|setExecutable\(|setReadable\(|FileOutputStream\()",
                     "CWE-89": r"(executeQuery\(|prepareStatement\(|executeUpdate\(|Statement |createStatement\()",
                     "CWE-79": r"(getWriter\(\)\.print|out\.println)",
@@ -770,7 +758,26 @@ class VulnerabilityInferenceEngine:
                     if sink_found:
                         sink_score = 40.0
                     else:
-                        sink_score = 0.0
+                        # Known CWE but NO sink found → strong negative signal
+                        sink_score = -10.0
+
+                # DTO/POJO Detection: if the file has no code logic (only fields,
+                # annotations, imports, class declarations), it cannot contain vulnerabilities.
+                # Instead of matching method signatures (fragile), look for control-flow
+                # and logic keywords that never appear in pure DTOs.
+                stripped_lines = [l.strip() for l in code_content.splitlines() if l.strip()]
+                has_code_logic = any(
+                    re.search(
+                        r'(\bif\s*\(|\bfor\s*\(|\bwhile\s*\(|\btry\s*\{|\bcatch\s*\(|'
+                        r'\breturn\s|\bthrow\s|\bnew\s+\w+\(|'
+                        r'\.\w+\s*\([^)]*\))',  # method calls like .exec(), .readFile()
+                        l
+                    )
+                    for l in stripped_lines
+                )
+                if not has_code_logic and len(stripped_lines) < 30:
+                    sink_score = -30.0
+                    logger.info(f"DTO/POJO detected (no code logic, {len(stripped_lines)} lines) — penalizing finding")
 
             # Component 3: False Positive Component (Max 20 points, or penalty)
             fp_score = 20.0
@@ -780,11 +787,21 @@ class VulnerabilityInferenceEngine:
                 if 0 <= line_idx < len(lines):
                     flagged_line = lines[line_idx]
                     # Check for false positive patterns (Regex compilation, import, comment, package, empty brackets, boilerplate annotations, constructors, exceptions)
-                    if re.search(r"(Pattern\.compile|java\.util\.regex|^\s*//|^\s*import |^\s*package |^\s*[{}]\s*$|^\s*@(?:Test|SpringBootTest|Before|After|Override)\b|void\s+[a-zA-Z0-9_]+\s*\(|^\s*super\(|class\s+[A-Za-z0-9_]+Exception|^\s*(?:public|protected|private)\s+[A-Z][a-zA-Z0-9_]*\s*\()", flagged_line):
+                    if re.search(r"(Pattern\.compile|java\.util\.regex|^\s*//|^\s*import |^\s*package |^\s*[{}]\s*$|^\s*@(?:Test|SpringBootTest|Before|After|Override|Data|Getter|Setter|Builder|NoArgsConstructor|AllArgsConstructor|Value|Immutable)\b|void\s+[a-zA-Z0-9_]+\s*\(|^\s*super\(|class\s+[A-Za-z0-9_]+Exception|^\s*(?:public|protected|private)\s+[A-Z][a-zA-Z0-9_]*\s*\()", flagged_line):
                         if not sink_found:
                             fp_score = -20.0  # Apply penalty if it looks like a false positive and no sink validates it
                         else:
                             fp_score = 0.0
+
+            # Also penalize if the flagged line is just a field declaration (common in DTOs)
+            if code_content and "location" in vuln and "line" in vuln["location"]:
+                line_idx = vuln["location"]["line"] - 1
+                lines = code_content.splitlines()
+                if 0 <= line_idx < len(lines):
+                    flagged_line = lines[line_idx].strip()
+                    if re.match(r'^(public|private|protected)?\s*(String|int|long|boolean|List|Map|Set|Optional)\s+\w+\s*;', flagged_line):
+                        fp_score = -20.0
+                        logger.info(f"Flagged line is a simple field declaration — applying FP penalty")
 
             # Final Decision based on Total Weight (Max 100, Threshold 50)
             total_weight = confidence_score + sink_score + fp_score
@@ -797,6 +814,7 @@ class VulnerabilityInferenceEngine:
                 logger.info(f"Weighted Validation: Kept {vuln.get('cwe_id')} (Score: {total_weight:.1f}/100) -> Conf: {confidence_score:.1f}, Sink: {sink_score}, FP: {fp_score}")
 
             validated.append(vuln)
+
 
         if dropped > 0:
             logger.warning(f"Validation dropped {dropped} entries, kept {len(validated)}")

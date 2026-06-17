@@ -127,20 +127,25 @@ def run_training(
             tokenizer.pad_token = tokenizer.eos_token
             if tokenizer.pad_token_id is None:
                 tokenizer.pad_token_id = tokenizer.eos_token_id
+        logger.info("[STEP 2/9 DONE] Tokenizer loaded successfully.")
 
         # 3. Prepare Model for k-bit training
         if torch.cuda.is_available():
-            logger.info("Preparing model for k-bit training...")
+            logger.info("[STEP 3/9] Preparing model for k-bit training...")
             model = prepare_model_for_kbit_training(model)
         else:
             logger.info("Enabling input gradients for CPU gradient checkpointing...")
             model.enable_input_require_grads()
 
+        logger.info("[STEP 3/9 DONE] Model prepared for k-bit training.")
+
         # 4. Detect target modules for LoRA
+        logger.info("[STEP 4/9] Detecting target LoRA modules...")
         target_modules = find_all_linear_names(model)
         logger.info(f"Targeting modules for LoRA parameter tuning: {target_modules}")
 
         # 5. Configure LoRA adapter settings
+        logger.info("[STEP 5/9] Configuring LoRA adapter...")
         peft_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -152,13 +157,16 @@ def run_training(
         model = get_peft_model(model, peft_config)
         logger.info("LoRA configuration overlay successful. Trainable parameters summary:")
         model.print_trainable_parameters()
+        logger.info("[STEP 5/9 DONE] LoRA adapter configured.")
 
         # 6. Load Datasets
+        logger.info("[STEP 6/9] Loading training dataset...")
         train_dataset = JavaVulnerabilityDataset(
             jsonl_path=dataset_path,
             tokenizer=tokenizer,
             max_length=max_length
         )
+        logger.info(f"[STEP 6/9 DONE] Loaded {len(train_dataset)} training examples.")
         
         eval_dataset = None
         if eval_dataset_path:
@@ -171,7 +179,16 @@ def run_training(
         data_collator = CausalLMDataCollator(tokenizer=tokenizer)
 
         # 7. Configure Training Arguments
+        logger.info("[STEP 7/9] Configuring training arguments...")
         is_cuda = torch.cuda.is_available()
+        
+        # Log GPU memory status before training
+        if is_cuda:
+            gpu_mem_total = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            gpu_mem_alloc = torch.cuda.memory_allocated(0) / (1024**3)
+            gpu_mem_reserved = torch.cuda.memory_reserved(0) / (1024**3)
+            logger.info(f"GPU Memory: {gpu_mem_alloc:.1f}GB allocated, {gpu_mem_reserved:.1f}GB reserved, {gpu_mem_total:.1f}GB total")
+        
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=epochs,
@@ -190,8 +207,10 @@ def run_training(
             gradient_checkpointing=True,
             report_to="none"
         )
+        logger.info(f"[STEP 7/9 DONE] Training args: batch_size={batch_size}, grad_accum={grad_accum}, epochs={epochs}, lr={lr}")
 
         # 8. Initialize Trainer
+        logger.info("[STEP 8/9] Initializing Trainer...")
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -199,9 +218,10 @@ def run_training(
             eval_dataset=eval_dataset,
             data_collator=data_collator
         )
+        logger.info("[STEP 8/9 DONE] Trainer initialized.")
 
         # 9. Execute Training
-        logger.info("Executing model training loop...")
+        logger.info("[STEP 9/9] Starting training loop...")
         trainer.train()
         logger.info("Fine-tuning pipeline execution successfully completed.")
 
@@ -223,7 +243,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_dataset_path", type=str, default=None, help="Path to validation JSONL dataset (optional)")
     parser.add_argument("--output_dir", type=str, default="./adapters", help="Output directory for saved adapters")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per device")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size per device")
     parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank dimension")

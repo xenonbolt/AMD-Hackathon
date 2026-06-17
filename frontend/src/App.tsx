@@ -211,7 +211,7 @@ export default function App() {
               vramTotal: data.vram_total || 198000,
               gpuName: data.gpu_name || 'AMD MI300X',
               gpuType: data.gpu_type || 'HBM3 Memory Cluster',
-              modelsLoaded: data.models_loaded || ['Qwen/Qwen2.5-Coder-7B-Instruct'],
+              modelsLoaded: data.models_loaded || ['DeepSeek-Coder-6.7B-Instruct (Vuln Scanner)', 'Qwen2.5-Coder-7B-Instruct (Fix Engine)'],
               apiHealth: data.api_health || 'Unknown'
             });
           }
