@@ -22,30 +22,26 @@ logging.basicConfig(
 logger = logging.getLogger("inference_engine")
 
 PROMPT_TEMPLATE = (
-    "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. Return structured JSON only in English.\n\n"
-    "<|input|>\n{raw_code}\n\n"
-    "<|response|>\n"
-)
-
-PROMPT_TEMPLATE = (
     "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. "
     "Return structured JSON ONLY inside a top-level \"vulnerabilities\" array. "
-    "EXTREMELY IMPORTANT: You MUST write your ENTIRE response strictly in English. Do NOT use French, Spanish, or any other language under any circumstances. "
-    "All fields in the JSON response, including 'cwe_name', 'description', 'impact', and 'recommendation', "
-    "must be written in English. "
-    "For each vulnerability, ensure the 'description' field contains a concise (2-3 sentences) "
-    "but technically precise explanation of the exploit in English, referencing specific variables and method names. "
-    "Keep explanations brief and direct to optimize response time.\n\n"
+    "You MUST write your ENTIRE response strictly in English. "
+    "For each vulnerability, provide: cwe_id, cwe_name, severity (critical/high/medium/low), "
+    "confidence (0.0-1.0), location (with line number), description (2-3 sentences referencing "
+    "specific variables and method names), impact, and recommendation. "
+    "Keep explanations brief and direct.\n\n"
     "EXAMPLE OUTPUT FORMAT:\n"
     "```json\n"
     "{\n"
     "  \"vulnerabilities\": [\n"
     "    {\n"
-    "      \"cwe_name\": \"SQL Injection\",\n"
     "      \"cwe_id\": \"CWE-89\",\n"
-    "      \"description\": \"The method directly concatenates user input into a SQL query without sanitization. This allows an attacker to manipulate the query logic.\",\n"
-    "      \"impact\": \"High\",\n"
-    "      \"recommendation\": \"Use PreparedStatements to bind parameters securely.\"\n"
+    "      \"cwe_name\": \"SQL Injection\",\n"
+    "      \"severity\": \"high\",\n"
+    "      \"confidence\": 0.95,\n"
+    "      \"location\": {\"line\": 15},\n"
+    "      \"description\": \"User input from getParameter() is concatenated into the SQL query string passed to executeQuery() without sanitization, enabling SQL injection.\",\n"
+    "      \"impact\": \"An attacker can read, modify, or delete arbitrary database records.\",\n"
+    "      \"recommendation\": \"Use PreparedStatement with parameterized queries instead of string concatenation.\"\n"
     "    }\n"
     "  ]\n"
     "}\n"
@@ -804,6 +800,36 @@ class VulnerabilityInferenceEngine:
 
         if dropped > 0:
             logger.warning(f"Validation dropped {dropped} entries, kept {len(validated)}")
+
+        # --- Deduplication by (cwe_id, line) ---
+        # When the model produces multiple entries for the same CWE at the same line,
+        # keep only the entry with the longest (most specific) description.
+        seen: Dict[tuple, int] = {}  # (cwe_id, line) -> index in deduped list
+        deduped: List[Dict[str, Any]] = []
+        dedup_count = 0
+        for vuln in validated:
+            cwe = vuln.get("cwe_id", "")
+            line = vuln.get("location", {}).get("line", 0)
+            key = (cwe, line)
+            if key in seen:
+                # Duplicate found — keep the one with the longer description
+                existing_idx = seen[key]
+                existing = deduped[existing_idx]
+                if len(vuln.get("description", "")) > len(existing.get("description", "")):
+                    deduped[existing_idx] = vuln
+                    seen[key] = existing_idx
+                    logger.info(f"Dedup: Replaced shorter duplicate for {cwe} at line {line}")
+                else:
+                    logger.info(f"Dedup: Dropped duplicate for {cwe} at line {line} (shorter description)")
+                dedup_count += 1
+            else:
+                seen[key] = len(deduped)
+                deduped.append(vuln)
+
+        if dedup_count > 0:
+            logger.info(f"Deduplication: {len(validated)} → {len(deduped)} entries ({dedup_count} duplicates removed)")
+        validated = deduped
+
         logger.info(f"Validation: {len(vulns)} entries in → {len(validated)} entries out")
 
         return validated
