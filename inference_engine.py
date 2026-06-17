@@ -30,6 +30,7 @@ PROMPT_TEMPLATE = (
 PROMPT_TEMPLATE = (
     "<|instruction|>\nAnalyze the Java code and identify ALL security vulnerabilities. "
     "Return structured JSON ONLY inside a top-level \"vulnerabilities\" array. "
+    "EXTREMELY IMPORTANT: You MUST write your ENTIRE response strictly in English. Do NOT use French, Spanish, or any other language under any circumstances. "
     "All fields in the JSON response, including 'cwe_name', 'description', 'impact', and 'recommendation', "
     "must be written in English. "
     "For each vulnerability, ensure the 'description' field contains a concise (2-3 sentences) "
@@ -539,6 +540,30 @@ class VulnerabilityInferenceEngine:
         return None, None
 
     @staticmethod
+    def _sanitize_field(text: str) -> str:
+        """
+        Cleans repetitive nested parenthesis bugs from individual text fields
+        (e.g., "Exploitation de CWE-78 (Exploitation de CWE-78 (Exploitation...))")
+        """
+        if not text or not isinstance(text, str):
+            return text
+            
+        import re
+        prev = None
+        # Loop to collapse arbitrarily deep nesting
+        while text != prev:
+            prev = text
+            # Matches: X (X) -> X
+            text = re.sub(r'([^()]{10,})\s*\(\s*\1\s*\)?', r'\1', text)
+            # Matches: (X (X)) -> (X)
+            text = re.sub(r'\(\s*([^()]{10,})\s*\(\s*\1\s*\)?\)?', r'(\1)', text)
+            
+        # Clean up any trailing broken parenthesis
+        text = re.sub(r'(\s*\))+$', '', text).strip()
+        
+        return text
+
+    @staticmethod
     def _translate_to_english(text: str) -> str:
         """
         Translates text to English using deep-translator or translate package if installed.
@@ -600,8 +625,11 @@ class VulnerabilityInferenceEngine:
                 continue
 
             # Translate text fields to English if they are in another language (e.g. French)
-            for field in ["cwe_name", "description", "impact", "recommendation", "type"]:
+            for field in ["cwe_name", "description", "impact", "recommendation", "type", "message"]:
                 if vuln.get(field) and isinstance(vuln[field], str):
+                    # First sanitize any nested repetition bugs from the generation
+                    vuln[field] = VulnerabilityInferenceEngine._sanitize_field(vuln[field])
+                    # Then attempt translation if applicable
                     vuln[field] = VulnerabilityInferenceEngine._translate_to_english(vuln[field])
 
             # Fill in defaults for missing cwe fields instead of dropping the entry.

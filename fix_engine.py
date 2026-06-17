@@ -60,9 +60,9 @@ REMEDIATION REQUIREMENTS
 SECURITY REQUIREMENTS
 
 CWE-78:
-- Avoid invoking shell interpreters.
-- Never use Runtime.exec with concatenated input.
-- EXTREMELY IMPORTANT: Use ProcessBuilder with a List of separate string arguments for the executable and each of its flags (e.g., new ProcessBuilder("ping", "-c", "4", ip)). Do NOT pass the entire command as a single string.
+- NEVER use "sh", "bash", or "cmd.exe" in ProcessBuilder.
+- EXTREMELY IMPORTANT: Use ProcessBuilder with a List of separate string arguments for the executable and each of its flags (e.g., new ProcessBuilder("ping", "-c", "1", ip)). Do NOT pass the entire command as a single string.
+- When validating input with Regex, ALWAYS use matcher.matches() instead of matcher.find() and fully anchor regexes with ^ and $.
 
 CWE-89:
 - Use PreparedStatement.
@@ -72,8 +72,8 @@ CWE-79:
 - Use context-aware output encoding.
 
 CWE-22:
-- Use canonical paths.
-- Enforce allowlisted directories.
+- Mitigate TOCTOU (Time-of-Check Time-of-Use) by using java.nio.file.Path and toRealPath() for both base and target paths.
+- Ensure the normalized target path strictly starts with the base path.
 
 CWE-611:
 - Disable DTD processing.
@@ -83,9 +83,10 @@ CWE-502:
 - Use ObjectInputFilter or allowlists.
 
 CWE-918:
-- Validate URLs.
-- Block internal/private IPs.
-- Restrict redirects.
+- Parse URLs with java.net.URI and explicitly check that uri.getHost() is not null.
+- Enforce scheme validation (only http/https).
+- Mitigate DNS rebinding: strictly resolve the hostname to an InetAddress and block isAnyLocalAddress, isLoopbackAddress, isLinkLocalAddress, and isSiteLocalAddress.
+- Configure HTTP clients to NOT follow redirects automatically.
 
 OUTPUT FORMAT
 
@@ -247,9 +248,9 @@ RULES
 SECURITY RULES
 
 CWE-78
-- Avoid invoking shell interpreters.
-- Never concatenate user input into commands.
-- EXTREMELY IMPORTANT: Use ProcessBuilder with a List of separate string arguments for the executable and each of its flags (e.g., new ProcessBuilder("ping", "-c", "4", ip)). Do NOT pass the entire command as a single string.
+- NEVER use "sh", "bash", or "cmd.exe" in ProcessBuilder.
+- EXTREMELY IMPORTANT: Use ProcessBuilder with a List of separate string arguments for the executable and each of its flags (e.g., new ProcessBuilder("ping", "-c", "1", ip)). Do NOT pass the entire command as a single string.
+- When validating input with Regex, ALWAYS use matcher.matches() instead of matcher.find() and fully anchor regexes with ^ and $.
 
 CWE-89
 - Use PreparedStatement.
@@ -258,7 +259,8 @@ CWE-79
 - Use output encoding.
 
 CWE-22
-- Use canonical path validation.
+- Mitigate TOCTOU (Time-of-Check Time-of-Use) by using java.nio.file.Path and toRealPath() for both base and target paths.
+- Ensure the normalized target path strictly starts with the base path.
 
 CWE-611
 - Disable XXE processing.
@@ -267,7 +269,10 @@ CWE-502
 - Use ObjectInputFilter.
 
 CWE-918
-- Validate URLs and destinations.
+- Parse URLs with java.net.URI and explicitly check that uri.getHost() is not null.
+- Enforce scheme validation (only http/https).
+- Mitigate DNS rebinding: strictly resolve the hostname to an InetAddress and block isAnyLocalAddress, isLoopbackAddress, isLinkLocalAddress, and isSiteLocalAddress.
+- Configure HTTP clients to NOT follow redirects automatically.
 
 OUTPUT
 
