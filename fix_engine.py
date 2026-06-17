@@ -60,13 +60,9 @@ REMEDIATION REQUIREMENTS
 SECURITY REQUIREMENTS
 
 CWE-78:
+- Avoid invoking shell interpreters.
 - Never use Runtime.exec with concatenated input.
-- Never use:
-  sh -c
-  bash -c
-  cmd.exe /c
-  powershell -Command
-- Use ProcessBuilder with separate arguments.
+- EXTREMELY IMPORTANT: Use ProcessBuilder with a List of separate string arguments for the executable and each of its flags (e.g., new ProcessBuilder("ping", "-c", "4", ip)). Do NOT pass the entire command as a single string.
 
 CWE-89:
 - Use PreparedStatement.
@@ -251,13 +247,9 @@ RULES
 SECURITY RULES
 
 CWE-78
-- Never use:
-  sh -c
-  bash -c
-  cmd.exe /c
-  powershell -Command
+- Avoid invoking shell interpreters.
 - Never concatenate user input into commands.
-- Use ProcessBuilder with argument separation.
+- EXTREMELY IMPORTANT: Use ProcessBuilder with a List of separate string arguments for the executable and each of its flags (e.g., new ProcessBuilder("ping", "-c", "4", ip)). Do NOT pass the entire command as a single string.
 
 CWE-89
 - Use PreparedStatement.

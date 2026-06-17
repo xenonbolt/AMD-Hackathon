@@ -495,7 +495,10 @@ class VulnerabilityInferenceEngine:
             "auth": ("CWE-522", "Insufficiently Protected Credentials"),
             "redirect": ("CWE-601", "URL Redirection to Untrusted Site ('Open Redirect')"),
             "resource": ("CWE-400", "Uncontrolled Resource Consumption"),
-            "permission": ("CWE-276", "Incorrect Default Permissions")
+            "permission": ("CWE-276", "Incorrect Default Permissions"),
+            "ssrf": ("CWE-918", "Server-Side Request Forgery (SSRF)"),
+            "forgery": ("CWE-918", "Server-Side Request Forgery (SSRF)"),
+            "server-side": ("CWE-918", "Server-Side Request Forgery (SSRF)")
         }
 
         search_text = " ".join([
@@ -526,6 +529,7 @@ class VulnerabilityInferenceEngine:
                 "CWE-319": (r"(HttpURLConnection|Socket |http://|ftp://|SocketChannel)", "Cleartext Transmission of Sensitive Information"),
                 "CWE-522": (r"(getConnection\(|DriverManager|password|login)", "Insufficiently Protected Credentials"),
                 "CWE-601": (r"(sendRedirect\(|setHeader\(\"Location\")", "URL Redirection to Untrusted Site ('Open Redirect')"),
+                "CWE-918": (r"(exchange\(|execute\(|getForObject\(|postForEntity\(|HttpClient|URLConnection|RestTemplate)", "Server-Side Request Forgery (SSRF)"),
                 "CWE-400": (r"(Thread\.sleep\(|readLine\(\)|while \(|for \()", "Uncontrolled Resource Consumption"),
             }
             for cwe_id, (pattern, std_name) in sink_heuristics.items():
@@ -701,6 +705,7 @@ class VulnerabilityInferenceEngine:
                     "CWE-319": r"(HttpURLConnection|Socket |http://|ftp://|SocketChannel)",
                     "CWE-522": r"(getConnection\(|DriverManager|password|login)",
                     "CWE-601": r"(sendRedirect\(|setHeader\(\"Location\")",
+                    "CWE-918": r"(exchange\(|execute\(|getForObject\(|postForEntity\(|HttpClient|URLConnection|RestTemplate)",
                     "CWE-400": r"(Thread\.sleep\(|readLine\(\)|while \(|for \()",
                 }
                 

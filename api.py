@@ -32,7 +32,44 @@ class EndpointFilter(logging.Filter):
 # Add filter to uvicorn access logger
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
-app = FastAPI(title="CodeElixir.AI Backend API")
+from contextlib import asynccontextmanager
+
+engine = None
+fix_engine = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global engine, fix_engine
+    logger.info("Initializing VulnerabilityInferenceEngine...")
+    try:
+        engine = VulnerabilityInferenceEngine(
+            model_id="deepseek-ai/deepseek-coder-6.7b-base",
+            adapter_path="./adapters",
+            load_in_4bit=False  # No quant as requested
+        )
+        logger.info("Engine loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load engine: {e}")
+        engine = None
+
+    logger.info("Initializing FixInferenceEngine...")
+    try:
+        fix_engine = FixInferenceEngine(
+            model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
+            adapter_path="./adapters_fix",
+            load_in_4bit=False
+        )
+        logger.info("FixEngine loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load fix engine: {e}")
+        fix_engine = None
+
+    yield
+    # Cleanup on exit
+    engine = None
+    fix_engine = None
+
+app = FastAPI(title="CodeElixir.AI Backend API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,31 +93,7 @@ class ProxyMiddleware:
 
 app.add_middleware(ProxyMiddleware)
 
-# Initialize the engine at startup (lazy load can save boot time, but we'll do global initialization per standard)
-logger.info("Initializing VulnerabilityInferenceEngine...")
-try:
-    engine = VulnerabilityInferenceEngine(
-        model_id="deepseek-ai/deepseek-coder-6.7b-base",
-        adapter_path=None,  # Disabled adapters to match raw base model console output
-        load_in_4bit=False  # No quant as requested
-    )
-    logger.info("Engine loaded successfully.")
-except Exception as e:
-    logger.error(f"Failed to load engine: {e}")
-    # We allow the app to start, but subsequent calls will fail if engine is not loaded
-    engine = None
-
-logger.info("Initializing FixInferenceEngine...")
-try:
-    fix_engine = FixInferenceEngine(
-        model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
-        adapter_path="./adapters_fix",
-        load_in_4bit=False
-    )
-    logger.info("FixEngine loaded successfully.")
-except Exception as e:
-    logger.error(f"Failed to load fix engine: {e}")
-    fix_engine = None
+# Models are now initialized via FastAPI lifespan events
 
 
 class ScanFolderRequest(BaseModel):

@@ -27,9 +27,11 @@ import {
   ChevronDown,
   ChevronUp,
   LayoutDashboard,
-  History
+  History,
+  Copy
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import { diffLines } from "diff";
 import { JavaFile, Vulnerability, ScanHistoryEntry } from "./types";
 
 // Lightweight regex-based syntax tokenizer for Java code
@@ -135,6 +137,14 @@ export default function App() {
   const [loadedFiles, setLoadedFiles] = useState<JavaFile[]>([]);
   const [activeFileIndex, setActiveFileIndex] = useState<number>(0);
   const [droppedItemName, setDroppedItemName] = useState<string | null>(null);
+
+  const [fullscreenDiff, setFullscreenDiff] = useState<{
+    isOpen: boolean;
+    vuln: Vulnerability | null;
+  }>({ isOpen: false, vuln: null });
+
+  const [copiedWorkspace, setCopiedWorkspace] = useState(false);
+  const [copiedFixed, setCopiedFixed] = useState(false);
 
   // App Level Tabs
   const [activeTab, setActiveTab] = useState<"scan" | "history" | "rocm">("scan");
@@ -1238,25 +1248,16 @@ export default function App() {
                                         <GitCommit className="w-3.5 h-3.5 text-rose-500" /> side-by-side remediation comparison
                                       </h4>
 
-                                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                        {/* Old segment block */}
-                                        <div className="bg-red-50/70 p-3 rounded-xl border border-red-100 text-left">
-                                          <div className="text-red-750 font-sans text-[9px] mb-2 uppercase font-extrabold text-red-650">ORIGINAL</div>
-                                          <div className="font-mono text-xs text-red-900 border-l-2 border-red-400 pl-2 select-all overflow-x-auto whitespace-pre max-w-full font-semibold">
-                                            {v.snippet}
-                                          </div>
-                                        </div>
-
-                                        {/* Corrected segment block */}
-                                        <div className="bg-emerald-50/80 p-3 rounded-xl border border-emerald-100 text-left">
-                                          <div className="text-emerald-700 font-sans text-[9px] mb-2 uppercase font-extrabold flex items-center gap-1.5">
-                                            PROPOSED SECURE DEVIATION
-                                            <Sparkles className="w-2.5 h-2.5 text-emerald-650 animated-pulse" />
-                                          </div>
-                                          <div className="font-mono text-xs text-emerald-800 border-l-2 border-emerald-450 pl-2 select-all overflow-x-auto whitespace-pre max-w-full font-bold">
-                                            {v.remediatedSnippet}
-                                          </div>
-                                        </div>
+                                      <div className="flex justify-center py-2">
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setFullscreenDiff({ isOpen: true, vuln: v });
+                                          }}
+                                          className="px-6 py-3 bg-white border-2 border-indigo-200 text-indigo-700 hover:bg-indigo-50 hover:border-indigo-300 hover:text-indigo-800 rounded-xl font-bold flex items-center gap-2 shadow-sm transition-all"
+                                        >
+                                          <Eye className="w-4 h-4" /> View Diff
+                                        </button>
                                       </div>
 
                                       {/* Detailed technical explanation */}
@@ -1376,7 +1377,20 @@ export default function App() {
                     {/* Pseudo IDE status header */}
                     <div className="bg-slate-950 px-4 py-2 text-xs border-b border-slate-900/80 flex justify-between items-center shrink-0">
                       <span className="font-mono text-slate-400 truncate max-w-xs">{activeFile.path}</span>
-                      <span className="font-mono text-[9px] text-slate-500 font-semibold">Parser: JAVA (UTF-8)</span>
+                      <div className="flex items-center gap-3">
+                        <span className="font-mono text-[9px] text-slate-500 font-semibold hidden sm:inline">Parser: JAVA (UTF-8)</span>
+                        <button 
+                          onClick={() => {
+                            navigator.clipboard.writeText(activeFile.content);
+                            setCopiedWorkspace(true);
+                            setTimeout(() => setCopiedWorkspace(false), 2000);
+                          }}
+                          className="flex items-center gap-1.5 text-slate-400 hover:text-white transition-colors cursor-pointer bg-slate-800/50 hover:bg-slate-700/50 px-2 py-1 rounded border border-slate-800"
+                        >
+                          {copiedWorkspace ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+                          <span className="text-[9px] uppercase font-bold tracking-widest">{copiedWorkspace ? 'Copied' : 'Copy'}</span>
+                        </button>
+                      </div>
                     </div>
 
                     {/* Lines container element */}
@@ -1678,6 +1692,143 @@ export default function App() {
         )}
 
       </div>
+
+      {/* Fullscreen Diff Modal */}
+      <AnimatePresence>
+        {fullscreenDiff.isOpen && fullscreenDiff.vuln && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 md:p-8"
+            onClick={() => setFullscreenDiff({ isOpen: false, vuln: null })}
+          >
+            <div 
+              className="bg-white/95 backdrop-blur-2xl rounded-3xl flex flex-col w-full max-w-7xl h-[85vh] max-h-full overflow-hidden shadow-[0_30px_60px_-15px_rgba(0,0,0,0.3)] border border-white/60 ring-1 ring-slate-900/5"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between px-6 py-5 border-b border-slate-800/60 bg-slate-900 shrink-0 z-20 shadow-sm">
+              <h2 className="text-xl font-black bg-gradient-to-r from-indigo-400 to-violet-400 bg-clip-text text-transparent flex items-center gap-3 drop-shadow-sm">
+                <GitCommit className="w-6 h-6 text-indigo-400" />
+                Remediation Diff: <span className="font-mono text-slate-300 text-[17px] bg-white/10 px-3 py-1 rounded-lg border border-white/10 shadow-inner">{fullscreenDiff.vuln.filePath}</span>
+              </h2>
+              <button
+                onClick={() => setFullscreenDiff({ isOpen: false, vuln: null })}
+                className="p-2 hover:bg-white/10 rounded-full text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <XCircle className="w-6 h-6" />
+              </button>
+            </div>
+            
+            <div className="flex-1 flex min-h-0 overflow-hidden bg-slate-50/30">
+              <div className="w-1/2 h-full border-r border-slate-200/60 flex flex-col min-h-0">
+                <div className="px-4 py-3 bg-white/60 border-b border-slate-200/60 text-xs font-bold text-slate-500 uppercase tracking-widest text-center shadow-sm z-10 shrink-0 backdrop-blur-md">
+                  Original Code
+                </div>
+                <pre className="flex-1 overflow-auto p-6 font-mono text-[13px] leading-relaxed text-slate-700 m-0">
+                  {(() => {
+                    const vuln = fullscreenDiff.vuln;
+                    if (!vuln) return null;
+                    const file = loadedFiles.find(f => f.path === vuln.filePath || f.name === vuln.filePath.split('/').pop());
+                    const oldStr = file ? file.content : (vuln.snippet || "");
+                    const newStr = vuln.fullRemediatedContent || vuln.remediatedSnippet || "";
+                    const diffs = diffLines(oldStr, newStr);
+                    let lineNum = 1;
+                    return diffs.map((part, i) => {
+                      if (part.added) return null;
+                      const isRemoved = part.removed;
+                      const lines = part.value.split('\n');
+                      if (lines[lines.length - 1] === '') lines.pop();
+                      return (
+                        <span
+                          key={i}
+                          className={isRemoved ? "bg-rose-500/15 text-rose-800 font-semibold block w-full" : "text-slate-500 block w-full"}
+                        >
+                          {lines.map((line, j) => {
+                            const currentLineNum = lineNum++;
+                            return (
+                              <div key={j} className="flex hover:bg-slate-900/5">
+                                <span className="w-10 shrink-0 text-right pr-4 border-r border-slate-200/60 mr-4 text-slate-400 select-none text-[10px] opacity-70 flex items-center justify-end">{currentLineNum}</span>
+                                <span className="whitespace-pre-wrap break-all py-[1px]">{line || " "}</span>
+                              </div>
+                            );
+                          })}
+                        </span>
+                      );
+                    });
+                  })()}
+                </pre>
+              </div>
+              <div className="w-1/2 h-full flex flex-col min-h-0">
+                <div className="px-4 py-3 bg-emerald-50/50 border-b border-emerald-200/60 text-xs font-bold text-emerald-700 uppercase tracking-widest text-center flex items-center justify-between shadow-sm z-10 shrink-0 backdrop-blur-md">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-emerald-500" /> Proposed Secure Deviation
+                  </div>
+                  <button 
+                    onClick={() => {
+                      const newStr = fullscreenDiff.vuln?.fullRemediatedContent || fullscreenDiff.vuln?.remediatedSnippet || "";
+                      navigator.clipboard.writeText(newStr);
+                      setCopiedFixed(true);
+                      setTimeout(() => setCopiedFixed(false), 2000);
+                    }}
+                    className="flex items-center gap-1.5 text-emerald-700 hover:text-emerald-900 transition-colors cursor-pointer bg-emerald-200/40 hover:bg-emerald-300/50 px-2 py-1 rounded shadow-sm border border-emerald-300/50"
+                  >
+                    {copiedFixed ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span className="text-[9px] uppercase font-bold tracking-widest">{copiedFixed ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
+                <pre className="flex-1 overflow-auto p-6 font-mono text-[13px] leading-relaxed text-slate-700 m-0 bg-emerald-50/10">
+                  {(() => {
+                    const vuln = fullscreenDiff.vuln;
+                    if (!vuln) return null;
+                    const file = loadedFiles.find(f => f.path === vuln.filePath || f.name === vuln.filePath.split('/').pop());
+                    const oldStr = file ? file.content : (vuln.snippet || "");
+                    const newStr = vuln.fullRemediatedContent || vuln.remediatedSnippet || "";
+                    const diffs = diffLines(oldStr, newStr);
+                    let lineNum = 1;
+                    return diffs.map((part, i) => {
+                      if (part.removed) return null;
+                      const isAdded = part.added;
+                      const lines = part.value.split('\n');
+                      if (lines[lines.length - 1] === '') lines.pop();
+                      return (
+                        <span
+                          key={i}
+                          className={isAdded ? "bg-emerald-500/15 text-emerald-800 font-semibold block w-full" : "text-slate-500 block w-full"}
+                        >
+                          {lines.map((line, j) => {
+                            const currentLineNum = lineNum++;
+                            return (
+                              <div key={j} className="flex hover:bg-slate-900/5">
+                                <span className="w-10 shrink-0 text-right pr-4 border-r border-slate-200/60 mr-4 text-slate-400 select-none text-[10px] opacity-70 flex items-center justify-end">{currentLineNum}</span>
+                                <span className="whitespace-pre-wrap break-all py-[1px]">{line || " "}</span>
+                              </div>
+                            );
+                          })}
+                        </span>
+                      );
+                    });
+                  })()}
+                </pre>
+              </div>
+            </div>
+            {fullscreenDiff.vuln.remediationExplanation && (
+              <div className="px-6 py-5 bg-slate-900 border-t border-slate-800/60 shrink-0 shadow-[0_-4px_10px_-1px_rgba(0,0,0,0.3)] z-20">
+                 <div className="text-sm text-slate-300 font-medium flex gap-3 items-start">
+                   <div className="p-2 bg-indigo-500/20 text-indigo-400 rounded-xl shadow-sm border border-indigo-500/30 h-fit shrink-0 mt-0.5">
+                     <Info className="w-4 h-4" />
+                   </div>
+                   <div className="leading-relaxed">
+                     <strong className="text-indigo-300 font-bold uppercase tracking-wider text-[11px] block mb-1">Remediation Explanation</strong>
+                     <span className="text-slate-400">{fullscreenDiff.vuln.remediationExplanation}</span>
+                   </div>
+                 </div>
+              </div>
+            )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
