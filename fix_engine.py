@@ -4,6 +4,7 @@ platform.win32_ver = lambda release='', version='', csd='', ptype='': ('10', '10
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, Union
 
@@ -60,8 +61,8 @@ REMEDIATION REQUIREMENTS
 SECURITY REQUIREMENTS
 
 CWE-78:
-- NEVER use "sh", "bash", or "cmd.exe" in ProcessBuilder.
-- EXTREMELY IMPORTANT: Use ProcessBuilder with a List of separate string arguments for the executable and each of its flags (e.g., new ProcessBuilder("ping", "-c", "1", ip)). Do NOT pass the entire command as a single string.
+- NEVER use shell command interpreters. 
+- EXTREMELY IMPORTANT: You MUST pass the target executable and its arguments as a comma-separated list of individual string arguments to ProcessBuilder (e.g., new ProcessBuilder("ping", "-c", "1", ip)). Do NOT pass the entire command as a single string.
 - When validating input with Regex, ALWAYS use matcher.matches() instead of matcher.find() and fully anchor regexes with ^ and $.
 
 CWE-89:
@@ -248,8 +249,8 @@ RULES
 SECURITY RULES
 
 CWE-78
-- NEVER use "sh", "bash", or "cmd.exe" in ProcessBuilder.
-- EXTREMELY IMPORTANT: Use ProcessBuilder with a List of separate string arguments for the executable and each of its flags (e.g., new ProcessBuilder("ping", "-c", "1", ip)). Do NOT pass the entire command as a single string.
+- NEVER use shell command interpreters. 
+- EXTREMELY IMPORTANT: You MUST pass the target executable and its arguments as a comma-separated list of individual string arguments to ProcessBuilder (e.g., new ProcessBuilder("ping", "-c", "1", ip)). Do NOT pass the entire command as a single string.
 - When validating input with Regex, ALWAYS use matcher.matches() instead of matcher.find() and fully anchor regexes with ^ and $.
 
 CWE-89
@@ -328,12 +329,28 @@ Line Number: {vulnerability.get("lineNumber") or vulnerability.get("line_number"
 
             # Parse JSON safely
             result = self._parse_json_safely(generated_response)
+            fixed_code = result.get("fixed_code", raw_code)
+
+            # Deterministic post-processing fallback for stubborn 7B LLMs that refuse to drop 'sh -c'
+            if vulnerability.get("cwe_id", "") == "CWE-78" or "sh" in fixed_code:
+                # Target the exact ping pattern commonly missed
+                fixed_code = re.sub(
+                    r'new\s+ProcessBuilder\s*\(\s*["\'](?:sh|bash|cmd(?:\.exe)?)["\']\s*,\s*["\'](?:-c|/c)["\']\s*,\s*["\']ping\s+-c\s+1\s+["\']\s*\+\s*([a-zA-Z0-9_]+)\s*\)',
+                    r'new ProcessBuilder("ping", "-c", "1", \1)',
+                    fixed_code
+                )
+                # General fallback for any other simple command invocation
+                fixed_code = re.sub(
+                    r'new\s+ProcessBuilder\s*\(\s*["\'](?:sh|bash|cmd(?:\.exe)?)["\']\s*,\s*["\'](?:-c|/c)["\']\s*,\s*([a-zA-Z0-9_]+)\s*\)',
+                    r'new ProcessBuilder(\1.split("\\\\s+"))',
+                    fixed_code
+                )
 
             # Construct return format
             return {
                 "remediationExplanation": result.get("explanation", "No explanation provided."),
-                "fullRemediatedContent": result.get("fixed_code", raw_code),
-                "remediatedSnippet": result.get("fixed_code", raw_code) # UI can use this as full string for display
+                "fullRemediatedContent": fixed_code,
+                "remediatedSnippet": fixed_code # UI can use this as full string for display
             }
 
         except Exception as err:
