@@ -572,6 +572,14 @@ class VulnerabilityInferenceEngine:
         if not text or not isinstance(text, str):
             return text
             
+        # Fast path: check if text is already English using langdetect
+        try:
+            from langdetect import detect
+            if detect(text) == 'en':
+                return text
+        except Exception:
+            pass
+            
         # 1. Try deep-translator (GoogleTranslator)
         try:
             from deep_translator import GoogleTranslator
@@ -761,8 +769,8 @@ class VulnerabilityInferenceEngine:
                 lines = code_content.splitlines()
                 if 0 <= line_idx < len(lines):
                     flagged_line = lines[line_idx]
-                    # Check for false positive patterns (Regex compilation, import, comment, package)
-                    if re.search(r"(Pattern\.compile|java\.util\.regex|^\s*//|^\s*import |^\s*package )", flagged_line):
+                    # Check for false positive patterns (Regex compilation, import, comment, package, empty brackets, boilerplate annotations)
+                    if re.search(r"(Pattern\.compile|java\.util\.regex|^\s*//|^\s*import |^\s*package |^\s*[{}]\s*$|^\s*@(?:Test|SpringBootTest|Before|After|Override)\b|void\s+[a-zA-Z0-9_]+\s*\()", flagged_line):
                         if not sink_found:
                             fp_score = -20.0  # Apply penalty if it looks like a false positive and no sink validates it
                         else:

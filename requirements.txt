@@ -8,3 +8,5 @@ sentencepiece
 protobuf
 datasets
 fastapi
+deep-translator
+langdetect
