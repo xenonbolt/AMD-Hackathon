@@ -61,7 +61,7 @@ logger.info("Initializing VulnerabilityInferenceEngine...")
 try:
     engine = VulnerabilityInferenceEngine(
         model_id="deepseek-ai/deepseek-coder-6.7b-base",
-        adapter_path=None,  # Disabled adapters to match raw base model console output
+        adapter_path="./adapters",
         load_in_4bit=False  # No quant as requested
     )
     logger.info("Engine loaded successfully.")
