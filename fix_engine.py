@@ -18,11 +18,93 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fix_engine")
 
-PROMPT_TEMPLATE = (
-    "<|instruction|>\nFix the vulnerability in the code\n\n"
-    "<|input|>\n{input_json}\n\n"
-    "<|response|>\n"
-)
+PROMPT_TEMPLATE = """
+<|instruction|>
+You are a Senior Java Application Security Engineer.
+
+Your task is to generate a secure remediation for the supplied Java source file.
+
+VULNERABILITY INFORMATION
+
+CWE ID: {cwe_id}
+CWE Name: {cwe_name}
+CVE ID: {cve_id}
+Line Number: {line_number}
+
+REMEDIATION REQUIREMENTS
+
+1. Analyze the supplied Java source code.
+2. Use the supplied CWE as the authoritative vulnerability classification.
+3. Use the supplied line number as the primary vulnerability location.
+4. The line number may be approximate. Inspect nearby code when necessary.
+5. Fix ONLY the vulnerability described by the supplied CWE.
+6. Preserve business functionality.
+7. Preserve package declarations.
+8. Preserve imports whenever possible.
+9. Preserve class names.
+10. Preserve method signatures.
+11. Preserve comments.
+12. Preserve formatting where practical.
+13. Do not remove functionality unless required for security.
+14. Do not introduce unrelated refactoring.
+15. Do not introduce new vulnerabilities.
+16. Do not invent frameworks.
+17. Do not invent dependencies.
+18. Add imports only when absolutely necessary.
+19. Return the ENTIRE corrected Java source file.
+20. Never return snippets.
+21. Never return diffs.
+22. Never return markdown.
+23. Never truncate the fixed code.
+
+SECURITY REQUIREMENTS
+
+CWE-78:
+- Never use Runtime.exec with concatenated input.
+- Never use:
+  sh -c
+  bash -c
+  cmd.exe /c
+  powershell -Command
+- Use ProcessBuilder with separate arguments.
+
+CWE-89:
+- Use PreparedStatement.
+- Never concatenate SQL.
+
+CWE-79:
+- Use context-aware output encoding.
+
+CWE-22:
+- Use canonical paths.
+- Enforce allowlisted directories.
+
+CWE-611:
+- Disable DTD processing.
+- Disable external entities.
+
+CWE-502:
+- Use ObjectInputFilter or allowlists.
+
+CWE-918:
+- Validate URLs.
+- Block internal/private IPs.
+- Restrict redirects.
+
+OUTPUT FORMAT
+
+Return ONLY valid JSON.
+
+{{
+  "explanation": "Detailed root cause and remediation explanation",
+  "fixed_code": "FULL corrected Java source file"
+}}
+
+<|input|>
+{input_json}
+
+<|response|>
+"""
 
 class FixInferenceEngine:
     """
@@ -109,29 +191,114 @@ class FixInferenceEngine:
         try:
             # Construct input JSON
             input_dict = {
-                "cwe_name": vulnerability.get("cwe_name", ""),
                 "cwe_id": vulnerability.get("cwe_id", ""),
-                "vulnerable_code": raw_code
+                "cwe_name": vulnerability.get("cwe_name", ""),
+                "cve_id": vulnerability.get("cve_id", ""),
+                "line_number": (
+                    vulnerability.get("lineNumber")
+                    or vulnerability.get("line_number")
+                ),
+                "vulnerable_code": raw_code,
+                "remediation_goal": (
+                    "Return the complete corrected Java file. "
+                    "Preserve functionality. "
+                    "Fix the specified vulnerability only."
+                )
             }
-            if "cve_id" in vulnerability:
-                input_dict["cve_id"] = vulnerability["cve_id"]
-            if "lineNumber" in vulnerability:
-                input_dict["line_number"] = vulnerability["lineNumber"]
-            elif "line_number" in vulnerability:
-                input_dict["line_number"] = vulnerability["line_number"]
-            
-            for key in ["description", "context", "impact", "recommendation"]:
-                if key in vulnerability and vulnerability[key]:
-                    input_dict[key] = vulnerability[key]
                 
             input_json = json.dumps(input_dict, ensure_ascii=False)
             
             if self.using_adapter:
-                prompt = PROMPT_TEMPLATE.format(input_json=input_json)
+                prompt = PROMPT_TEMPLATE.format(input_json=input_json, **input_dict)
             else:
                 messages = [
-                    {"role": "system", "content": "You are an expert security engineer. Fix the vulnerability in the provided code. Output ONLY valid JSON containing an 'explanation' string and a 'fixed_code' string. The 'fixed_code' MUST contain the ENTIRE completely updated Java file. Do not output only a snippet. CRITICAL SECURITY RULE: When fixing Command Injection (CWE-78), NEVER use shell interpreters like 'sh -c' or 'bash -c' with concatenated variables. You MUST pass the executable and all arguments as separate array elements to ProcessBuilder (e.g., new ProcessBuilder(\"ping\", \"-c\", \"1\", userInput)). No markdown formatting, just pure JSON."},
-                    {"role": "user", "content": f"Fix the vulnerability in the code:\n{input_json}"}
+                    {
+                        "role": "system",
+                        "content": """
+You are a Senior Java Security Engineer specializing in vulnerability remediation.
+
+You will receive:
+
+- CWE ID
+- CWE Name
+- Optional CVE
+- Vulnerability line number
+- Complete Java source file
+
+Your task is to generate a production-quality security patch.
+
+RULES
+
+1. Use the supplied CWE as authoritative.
+2. Analyze the code before generating a fix.
+3. Fix the vulnerability at or near the provided line number.
+4. Preserve functionality.
+5. Preserve class structure.
+6. Preserve package declarations.
+7. Preserve imports whenever possible.
+8. Preserve method signatures.
+9. Preserve comments.
+10. Return the COMPLETE corrected Java file.
+11. Never return snippets.
+12. Never return diffs.
+13. Never return markdown.
+14. Never return pseudo-code.
+15. Never return partial files.
+16. Never invent frameworks.
+17. Never invent libraries.
+18. Never introduce unrelated refactoring.
+
+SECURITY RULES
+
+CWE-78
+- Never use:
+  sh -c
+  bash -c
+  cmd.exe /c
+  powershell -Command
+- Never concatenate user input into commands.
+- Use ProcessBuilder with argument separation.
+
+CWE-89
+- Use PreparedStatement.
+
+CWE-79
+- Use output encoding.
+
+CWE-22
+- Use canonical path validation.
+
+CWE-611
+- Disable XXE processing.
+
+CWE-502
+- Use ObjectInputFilter.
+
+CWE-918
+- Validate URLs and destinations.
+
+OUTPUT
+
+Return ONLY valid JSON:
+
+{
+  "explanation": "Root cause and remediation explanation",
+  "fixed_code": "FULL corrected Java source file"
+}
+"""
+                    },
+                    {
+                        "role": "user",
+                        "content": f'''
+Fix the vulnerability.
+
+CWE ID: {vulnerability.get("cwe_id","")}
+CWE Name: {vulnerability.get("cwe_name","")}
+Line Number: {vulnerability.get("lineNumber") or vulnerability.get("line_number")}
+
+{input_json}
+'''
+                    }
                 ]
                 prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -144,8 +311,11 @@ class FixInferenceEngine:
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
-                    use_cache=True,
                     do_sample=False,
+                    temperature=0.0,
+                    top_p=1.0,
+                    repetition_penalty=1.05,
+                    use_cache=True,
                     eos_token_id=self.tokenizer.eos_token_id,
                     pad_token_id=self.tokenizer.pad_token_id
                 )
