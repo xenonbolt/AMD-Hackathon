@@ -36,6 +36,20 @@ PROMPT_TEMPLATE = (
     "For each vulnerability, ensure the 'description' field contains a concise (2-3 sentences) "
     "but technically precise explanation of the exploit in English, referencing specific variables and method names. "
     "Keep explanations brief and direct to optimize response time.\n\n"
+    "EXAMPLE OUTPUT FORMAT:\n"
+    "```json\n"
+    "{\n"
+    "  \"vulnerabilities\": [\n"
+    "    {\n"
+    "      \"cwe_name\": \"SQL Injection\",\n"
+    "      \"cwe_id\": \"CWE-89\",\n"
+    "      \"description\": \"The method directly concatenates user input into a SQL query without sanitization. This allows an attacker to manipulate the query logic.\",\n"
+    "      \"impact\": \"High\",\n"
+    "      \"recommendation\": \"Use PreparedStatements to bind parameters securely.\"\n"
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "```\n\n"
     "<|input|>\n{raw_code}\n\n"
     "<|response|>\n"
 )
@@ -520,7 +534,7 @@ class VulnerabilityInferenceEngine:
             sink_heuristics = {
                 "CWE-78": (r"(Runtime\.getRuntime\(\)\.exec\(|new ProcessBuilder\(|ProcessBuilder\()", "OS Command Injection"),
                 "CWE-20": (r"(Runtime\.getRuntime\(\)\.exec\(|new ProcessBuilder\(|ProcessBuilder\()", "Improper Input Validation"),
-                "CWE-22": (r"(new File\(|new FileReader\(|new FileInputStream\(|new FileOutputStream\(|Paths\.get\()", "Relative Path Traversal"),
+                "CWE-22": (r"(\bFile\b|\bFileInputStream\b|\bFileOutputStream\b|\bFileReader\b|\bFileWriter\b|\bPaths\.get\b|\bFiles\.read\b|\bFiles\.write\b|\bMultipartFile\b|\bInputStream\b|\bOutputStream\b)", "Path Traversal"),
                 "CWE-276": (r"(new File\(|new FileReader\(|createTempFile\(|setExecutable\(|setReadable\(|FileOutputStream\()", "Incorrect Default Permissions"),
                 "CWE-89": (r"(executeQuery\(|prepareStatement\(|executeUpdate\(|Statement |createStatement\()", "SQL Injection"),
                 "CWE-79": (r"(getWriter\(\)\.print|out\.println)", "Cross-Site Scripting"),
@@ -530,7 +544,7 @@ class VulnerabilityInferenceEngine:
                 "CWE-319": (r"(HttpURLConnection|Socket |http://|ftp://|SocketChannel)", "Cleartext Transmission of Sensitive Information"),
                 "CWE-522": (r"(getConnection\(|DriverManager|password|login)", "Insufficiently Protected Credentials"),
                 "CWE-601": (r"(sendRedirect\(|setHeader\(\"Location\")", "URL Redirection to Untrusted Site ('Open Redirect')"),
-                "CWE-918": (r"(exchange\(|execute\(|getForObject\(|postForEntity\(|HttpClient|URLConnection|RestTemplate)", "Server-Side Request Forgery (SSRF)"),
+                "CWE-918": (r"(exchange\(|execute\(|getForObject\(|postForEntity\(|HttpClient\.new|openConnection\()", "Server-Side Request Forgery (SSRF)"),
                 "CWE-400": (r"(Thread\.sleep\(|readLine\(\)|while \(|for \()", "Uncontrolled Resource Consumption"),
             }
             for cwe_id, (pattern, std_name) in sink_heuristics.items():
@@ -731,7 +745,7 @@ class VulnerabilityInferenceEngine:
                 sink_heuristics = {
                     "CWE-78": r"(Runtime\.getRuntime\(\)\.exec\(|new ProcessBuilder\(|ProcessBuilder\()",
                     "CWE-20": r"(Runtime\.getRuntime\(\)\.exec\(|new ProcessBuilder\(|ProcessBuilder\()",
-                    "CWE-22": r"(new File\(|new FileReader\(|new FileInputStream\(|new FileOutputStream\(|Paths\.get\()",
+                    "CWE-22": r"(\bFile\b|\bFileInputStream\b|\bFileOutputStream\b|\bFileReader\b|\bFileWriter\b|\bPaths\.get\b|\bFiles\.read\b|\bFiles\.write\b|\bMultipartFile\b|\bInputStream\b|\bOutputStream\b)",
                     "CWE-276": r"(new File\(|new FileReader\(|createTempFile\(|setExecutable\(|setReadable\(|FileOutputStream\()",
                     "CWE-89": r"(executeQuery\(|prepareStatement\(|executeUpdate\(|Statement |createStatement\()",
                     "CWE-79": r"(getWriter\(\)\.print|out\.println)",
@@ -741,7 +755,7 @@ class VulnerabilityInferenceEngine:
                     "CWE-319": r"(HttpURLConnection|Socket |http://|ftp://|SocketChannel)",
                     "CWE-522": r"(getConnection\(|DriverManager|password|login)",
                     "CWE-601": r"(sendRedirect\(|setHeader\(\"Location\")",
-                    "CWE-918": r"(exchange\(|execute\(|getForObject\(|postForEntity\(|HttpClient|URLConnection|RestTemplate)",
+                    "CWE-918": r"(exchange\(|execute\(|getForObject\(|postForEntity\(|HttpClient\.new|openConnection\()",
                     "CWE-400": r"(Thread\.sleep\(|readLine\(\)|while \(|for \()",
                 }
                 
@@ -769,8 +783,8 @@ class VulnerabilityInferenceEngine:
                 lines = code_content.splitlines()
                 if 0 <= line_idx < len(lines):
                     flagged_line = lines[line_idx]
-                    # Check for false positive patterns (Regex compilation, import, comment, package, empty brackets, boilerplate annotations)
-                    if re.search(r"(Pattern\.compile|java\.util\.regex|^\s*//|^\s*import |^\s*package |^\s*[{}]\s*$|^\s*@(?:Test|SpringBootTest|Before|After|Override)\b|void\s+[a-zA-Z0-9_]+\s*\()", flagged_line):
+                    # Check for false positive patterns (Regex compilation, import, comment, package, empty brackets, boilerplate annotations, constructors, exceptions)
+                    if re.search(r"(Pattern\.compile|java\.util\.regex|^\s*//|^\s*import |^\s*package |^\s*[{}]\s*$|^\s*@(?:Test|SpringBootTest|Before|After|Override)\b|void\s+[a-zA-Z0-9_]+\s*\(|^\s*super\(|class\s+[A-Za-z0-9_]+Exception|^\s*(?:public|protected|private)\s+[A-Z][a-zA-Z0-9_]*\s*\()", flagged_line):
                         if not sink_found:
                             fp_score = -20.0  # Apply penalty if it looks like a false positive and no sink validates it
                         else:

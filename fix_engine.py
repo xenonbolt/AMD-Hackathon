@@ -331,6 +331,9 @@ Line Number: {vulnerability.get("lineNumber") or vulnerability.get("line_number"
             result = self._parse_json_safely(generated_response)
             fixed_code = result.get("fixed_code", raw_code)
 
+            # Fix common LLM syntax error where it appends $ to the regex but swallows the closing quote
+            fixed_code = re.sub(r'\)\$\s*,\s*Pattern\.CASE_INSENSITIVE', r')$", Pattern.CASE_INSENSITIVE', fixed_code)
+
             # Deterministic post-processing fallback for stubborn 7B LLMs that refuse to drop 'sh -c'
             if vulnerability.get("cwe_id", "") == "CWE-78" or "sh" in fixed_code:
                 # Target the exact ping pattern commonly missed

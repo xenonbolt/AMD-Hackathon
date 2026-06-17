@@ -1414,9 +1414,9 @@ export default function App() {
                             key={idx}
                             id={`line-anchor-${lineNum}`}
                             className={`flex items-start transition-all ${isVulnerabilitySelected
-                                ? "bg-rose-500/20 border-l-4 border-rose-500 -ml-4 pl-3"
+                                ? "bg-rose-500/15 border-l-4 border-rose-400 -ml-4 pl-3"
                                 : isLineMatched
-                                  ? "bg-rose-950/20 border-l-2 border-rose-450 -ml-4 pl-3.5 cursor-pointer text-rose-350 font-semibold"
+                                  ? "bg-rose-500/10 border-l-2 border-rose-400 -ml-4 pl-3.5 cursor-pointer text-rose-300 font-semibold"
                                   : "text-slate-300"
                               }`}
                             onClick={() => matchingVuln && handleVulnerabilityClick(matchingVuln)}
@@ -1428,7 +1428,7 @@ export default function App() {
                             </div>
 
                             {/* Live content characters */}
-                            <div className={`whitespace-pre break-all ${isLineMatched ? "font-bold bg-rose-500/10 px-1 rounded text-rose-100" : ""}`}>
+                            <div className={`whitespace-pre break-all ${isLineMatched ? "font-bold bg-rose-400/10 px-1 rounded text-rose-200" : ""}`}>
                               {renderHighlightedCode(lineContent)}
                             </div>
                           </div>
