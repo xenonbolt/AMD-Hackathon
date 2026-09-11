@@ -245,6 +245,8 @@ def run_training(
             if tokenizer.pad_token_id is None:
                 tokenizer.pad_token_id = tokenizer.eos_token_id
 
+        logger.info("Disabling KV Cache for memory efficiency during training...")
+        model.config.use_cache = False
         logger.info("Enabling input gradients for CPU gradient checkpointing...")
         model.enable_input_require_grads()
 
@@ -288,6 +290,9 @@ def run_training(
             report_to="none"
         )
 
+        logger.info("Forcing aggressive garbage collection before FSDP wrapper takes over...")
+        import gc; gc.collect()
+        
         trainer = Trainer(
             model=model,
             args=training_args,

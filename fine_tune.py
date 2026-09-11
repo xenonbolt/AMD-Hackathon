@@ -125,6 +125,8 @@ def run_training(
                 tokenizer.pad_token_id = tokenizer.eos_token_id
 
         # 3. Prepare Model
+        logger.info("Disabling KV Cache for memory efficiency during training...")
+        model.config.use_cache = False
         logger.info("Enabling input gradients for CPU gradient checkpointing...")
         model.enable_input_require_grads()
 
@@ -188,6 +190,9 @@ def run_training(
         )
 
         # 8. Initialize Trainer
+        logger.info("Forcing aggressive garbage collection before FSDP wrapper takes over...")
+        import gc; gc.collect()
+        
         trainer = Trainer(
             model=model,
             args=training_args,
