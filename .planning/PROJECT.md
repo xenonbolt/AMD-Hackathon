@@ -12,18 +12,27 @@ Scale model fine-tuning horizontally using CPU and RAM resources across multiple
 
 ### Validated
 
-- ✓ Data preparation pipeline (`data_preparation.py` handling JSONL loading and tokenization) — existing
-- ✓ Base model fine-tuning logic for vulnerability detection/remediation (`fine_tune.py`, `train_fix_model.py`) — existing
-- ✓ Inference engines and static scanner (`inference_engine.py`, `fix_engine.py`, `scanner.py`) — existing
-- ✓ API Backend (FastAPI) — existing
-- ✓ React SPA Frontend — existing
+- ✓ Data preparation pipeline (`data_preparation.py` handling JSONL loading and tokenization)
+- ✓ Base model fine-tuning logic for vulnerability detection/remediation (`fine_tune.py`, `train_fix_model.py`)
+- ✓ Inference engines and static scanner (`inference_engine.py`, `fix_engine.py`, `scanner.py`)
+- ✓ API Backend (FastAPI)
+- ✓ React SPA Frontend
+- ✓ CPU-only PyTorch FSDP migration (Phase 2)
+- ✓ Swarm topology and node discovery (Phase 1)
+- ✓ Parameter sharding and low-RAM virtual swap mitigations (Phase 4)
 
 ### Active
 
-- [ ] Migrate `fine_tune.py` and `train_fix_model.py` from QLoRA/GPU-centric code to CPU-only PyTorch FSDP.
-- [ ] Implement PyTorch Native FSDP using the `gloo` backend for inter-node communication.
-- [ ] Configure the swarm topology (1 master, 3 worker nodes).
-- [ ] Enable parameter sharding across the CPUs/RAM of all 4 servers to handle larger models without OOM on a single node.
+*(No active requirements. Milestone v1 completed. Waiting for v2.)*
+
+## Current State
+- **v1 Completed**: The CPU Swarm architecture is fully functional. 
+- Infrastructure orchestrated via `gloo` and FSDP with 16GB Virtual Swap enabled for 15GB RAM limit bypass. 
+- All CUDA / GPU code has been successfully purged.
+
+## Next Milestone Goals
+- Dynamic node scaling (adding/removing nodes mid-training).
+- Fault tolerance (checkpointing and restoring if a worker node goes down).
 
 ### Out of Scope
 
@@ -65,4 +74,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-11 after initialization*
+*Last updated: 2026-09-11 after v1 completion*
