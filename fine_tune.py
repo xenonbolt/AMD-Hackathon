@@ -12,15 +12,13 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     Trainer,
     TrainingArguments
 )
 
 from peft import (
     LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training
+    get_peft_model
 )
 
 from data_preparation import JavaVulnerabilityDataset, CausalLMDataCollator
@@ -38,14 +36,11 @@ def find_all_linear_names(model: torch.nn.Module) -> List[str]:
     Dynamically identifies all linear layer module names in the target model.
     Ensures target module compatibility across different model architectures (e.g., Llama, StarCoder).
     """
-    import bitsandbytes as bnb
-    cls_4bit = bnb.nn.Linear4bit
-    cls_8bit = bnb.nn.Linear8bitLt
     cls_linear = torch.nn.Linear
     
     linear_layers = set()
     for name, module in model.named_modules():
-        if isinstance(module, (cls_4bit, cls_8bit, cls_linear)):
+        if isinstance(module, cls_linear):
             names = name.split(".")
             # Target the leaf module name (e.g., 'q_proj', 'v_proj')
             linear_layers.add(names[-1])
@@ -83,35 +78,22 @@ def run_training(
     and runs the HuggingFace Trainer to fine-tune the model.
     """
     try:
-        logger.info(f"Targeting device setup. CUDA status: {torch.cuda.is_available()}")
-        
-        # 1. Setup Quantization Configuration (NF4)
-        bnb_config = None
-        device_map = None
+        if "LOCAL_RANK" in os.environ:
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(backend="gloo")
+            local_rank = int(os.environ["LOCAL_RANK"])
+            logger.info(f"Distributed training initialized via torchrun. Local rank: {local_rank}")
+        else:
+            logger.info("Running in single-node mode without distributed process group.")
+
+        # CPU-only FSDP setup
         compute_dtype = torch.float32
 
-        if torch.cuda.is_available():
-            compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            logger.info(f"CUDA detected. Using computation dtype: {compute_dtype}")
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=compute_dtype
-            )
-            device_map = "auto"
-        else:
-            logger.warning("CUDA is not available. Model loading will fallback to CPU full precision (FP32).")
-
         # 2. Load Model & Tokenizer
-        logger.info(f"Loading base model: {model_id}")
-        torch_dtype = compute_dtype if torch.cuda.is_available() else torch.float32
-        logger.info(f"Selected model loading precision dtype: {torch_dtype}")
+        logger.info(f"Loading base model: {model_id} on CPU (FP32)")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            torch_dtype=torch_dtype,
+            torch_dtype=compute_dtype,
             trust_remote_code=True
         )
 
@@ -128,13 +110,9 @@ def run_training(
             if tokenizer.pad_token_id is None:
                 tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        # 3. Prepare Model for k-bit training
-        if torch.cuda.is_available():
-            logger.info("Preparing model for k-bit training...")
-            model = prepare_model_for_kbit_training(model)
-        else:
-            logger.info("Enabling input gradients for CPU gradient checkpointing...")
-            model.enable_input_require_grads()
+        # 3. Prepare Model
+        logger.info("Enabling input gradients for CPU gradient checkpointing...")
+        model.enable_input_require_grads()
 
         # 4. Detect target modules for LoRA
         target_modules = find_all_linear_names(model)
@@ -171,7 +149,9 @@ def run_training(
         data_collator = CausalLMDataCollator(tokenizer=tokenizer)
 
         # 7. Configure Training Arguments
-        is_cuda = torch.cuda.is_available()
+        # Use FSDP configuration parameters if distributed
+        fsdp_config = ["full_shard", "auto_wrap"] if "LOCAL_RANK" in os.environ else []
+        
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=epochs,
@@ -183,11 +163,13 @@ def run_training(
             logging_steps=10,
             save_strategy="epoch",
             eval_strategy="epoch" if eval_dataset else "no",
-            bf16=(is_cuda and compute_dtype == torch.bfloat16),
-            fp16=(is_cuda and compute_dtype == torch.float16),
-            optim="paged_adamw_8bit" if is_cuda else "adamw_torch",
+            bf16=False,
+            fp16=False,
+            use_cpu=True,
+            optim="adamw_torch",
             ddp_find_unused_parameters=False,
             gradient_checkpointing=True,
+            fsdp=fsdp_config,
             report_to="none"
         )
 
