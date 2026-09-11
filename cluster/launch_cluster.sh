@@ -29,7 +29,20 @@ echo "Script: $SCRIPT_PATH"
 echo "SSH User: $SSH_USER"
 echo "======================================"
 
-# 1. Launch on worker nodes via SSH
+# 1. Setup Swap on all nodes
+echo "Setting up 16GB swap space across the swarm to prevent OOM during initialization..."
+SWAP_SCRIPT_PATH=$(realpath "cluster/setup_swap.sh")
+
+for IP in "${WORKER_IPS[@]}"; do
+    echo "Configuring swap on worker: $IP..."
+    ssh -n ${SSH_USER}@${IP} "bash -s" < "$SWAP_SCRIPT_PATH"
+done
+
+echo "Configuring swap on master: $MASTER_IP..."
+bash "$SWAP_SCRIPT_PATH"
+echo "Swap configuration complete."
+
+# 2. Launch on worker nodes via SSH
 for IP in "${WORKER_IPS[@]}"; do
     echo "Starting torchrun on worker: $IP..."
     ssh -n -f ${SSH_USER}@${IP} "bash -c 'nohup torchrun \
@@ -41,7 +54,7 @@ for IP in "${WORKER_IPS[@]}"; do
         ${SCRIPT_PATH} > /tmp/torchrun_${IP}.log 2>&1 &'"
 done
 
-# 2. Launch on master node
+# 3. Launch on master node
 echo "Starting torchrun on master: $MASTER_IP..."
 torchrun \
     --nnodes=${NNODES} \

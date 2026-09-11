@@ -228,13 +228,14 @@ def run_training(
         else:
             logger.info("Running in single-node mode without distributed process group.")
 
-        compute_dtype = torch.float32
+        compute_dtype = torch.bfloat16
 
-        logger.info(f"Loading base model: {model_id} on CPU (FP32)")
+        logger.info(f"Loading base model: {model_id} on CPU (BF16)")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=compute_dtype,
-            trust_remote_code=True
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
         )
 
         logger.info(f"Loading tokenizer: {model_id}")
@@ -266,7 +267,7 @@ def run_training(
         )
         data_collator = FixCausalLMDataCollator(tokenizer=tokenizer)
 
-        fsdp_config = ["full_shard", "auto_wrap"] if "LOCAL_RANK" in os.environ else []
+        fsdp_config = ["full_shard", "auto_wrap", "sync_module_states"] if "LOCAL_RANK" in os.environ else []
         
         training_args = TrainingArguments(
             output_dir=output_dir,
