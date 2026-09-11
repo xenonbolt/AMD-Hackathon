@@ -10,7 +10,7 @@
 
 ### Phase Details
 
-**Phase 1: Architecture & Networking**
+### Phase 1: Architecture & Networking
 **Goal:** Establish the 4-node swarm and Gloo communication layer
 **Mode:** mvp
 **Requirements:** ARCH-01, ARCH-02, ARCH-03
@@ -19,7 +19,7 @@
 2. Rank assignment is correctly applied (Master is rank 0, workers 1-3).
 3. A simple distributed tensor all-reduce operation passes across all 4 nodes over CPU.
 
-**Phase 2: Pipeline Migration**
+### Phase 2: Pipeline Migration
 **Goal:** Refactor ML codebase for CPU FSDP and distributed data loading
 **Mode:** mvp
 **Requirements:** PIPE-01, PIPE-02, PIPE-03
@@ -28,7 +28,7 @@
 2. Model parameters are successfully sharded across CPU RAM of the 4 nodes using PyTorch FSDP.
 3. `DistributedSampler` ensures each node processes a unique shard of the JSONL dataset during training.
 
-**Phase 3: Validation & Metrics**
+### Phase 3: Validation & Metrics
 **Goal:** Benchmark and verify convergence of CPU FSDP model
 **Mode:** mvp
 **Requirements:** VAL-01, VAL-02

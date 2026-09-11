@@ -28,7 +28,8 @@ import {
   ChevronUp,
   LayoutDashboard,
   History,
-  Copy
+  Copy,
+  Download
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { diffLines } from "diff";
@@ -763,6 +764,27 @@ export default function App() {
     setIsSingleScanActive(false);
   };
 
+  // Action: Download current report
+  const handleDownloadReport = () => {
+    const reportData = {
+      timestamp: new Date().toISOString(),
+      stats: stats,
+      scanMode: scanMode,
+      vulnerabilities: vulnerabilities,
+      filesScanned: loadedFiles.map(f => f.name)
+    };
+    
+    const blob = new Blob([JSON.stringify(reportData, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `CodeElixir_Security_Report_${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-tr from-[#fbcfe8]/35 via-[#e6f4ea]/45 to-[#ccfbf1]/40 text-slate-800 font-sans p-4 md:p-6 selection:bg-emerald-500/20 selection:text-emerald-950 relative overflow-hidden">
       {/* Background colorful glassmorphic blur shapes with hints of green */}
@@ -963,6 +985,15 @@ export default function App() {
                           </>
                         )}
                       </button>
+                      {scanState === "completed" && (
+                        <button
+                          onClick={handleDownloadReport}
+                          className="px-4 py-2.5 rounded-xl text-xs font-bold tracking-wide shadow-sm transition-all flex items-center gap-2 bg-white text-indigo-600 hover:bg-indigo-50 border border-indigo-200"
+                          title="Download Report"
+                        >
+                          <Download className="w-3.5 h-3.5" /> Download Report
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
