@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Union
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 # Configure structured logging
@@ -63,8 +63,7 @@ class VulnerabilityInferenceEngine:
     def __init__(
         self,
         model_id: str,
-        adapter_path: Optional[Union[str, Path]] = None,
-        load_in_4bit: bool = True
+        adapter_path: Optional[Union[str, Path]] = None
     ) -> None:
         """
         Initializes the inference engine by loading the model and tokenizer.
@@ -72,7 +71,6 @@ class VulnerabilityInferenceEngine:
         Args:
             model_id: HuggingFace model hub ID or local path to base model.
             adapter_path: Local path to trained PEFT adapter checkpoints (optional).
-            load_in_4bit: Whether to load the base model in 4-bit precision (requires CUDA).
         """
         self.model_id = model_id
         self.adapter_path = adapter_path
@@ -102,29 +100,17 @@ class VulnerabilityInferenceEngine:
                 if self.tokenizer.pad_token_id is None:
                     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-            # Determine quantization and device map
-            bnb_config = None
+            # Determine device map and dtype
             device_map = "auto" if torch.cuda.is_available() else None
             torch_dtype = torch.float32
 
             if torch.cuda.is_available():
                 torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-            if load_in_4bit and torch.cuda.is_available():
-                logger.info(f"Configuring 4-bit BitsAndBytes quantization. Compute dtype: {torch_dtype}")
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch_dtype
-                )
-            else:
-                logger.warning(f"BitsAndBytes 4-bit is disabled or CUDA is unavailable. Loading base model in precision: {torch_dtype} (device_map={device_map})")
-
+            logger.info(f"Loading base/merged model in precision: {torch_dtype} (device_map={device_map})")
             logger.info(f"Loading base/merged model: {model_id} (local: {is_local})")
             base_model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                quantization_config=bnb_config,
                 device_map=device_map,
                 torch_dtype=torch_dtype,
                 attn_implementation="sdpa" if torch.cuda.is_available() else "eager",

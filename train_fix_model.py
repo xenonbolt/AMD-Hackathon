@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+import psutil
 import torch
 from torch.utils.data import Dataset
 from transformers import (
@@ -16,8 +17,20 @@ from transformers import (
     AutoTokenizer,
     PreTrainedTokenizer,
     Trainer,
-    TrainingArguments
+    TrainingArguments,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl
 )
+
+class HardwareMetricsCallback(TrainerCallback):
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
+        if logs is not None:
+            cpu = psutil.cpu_percent()
+            ram = psutil.virtual_memory().percent
+            logs["cpu_percent"] = cpu
+            logs["ram_percent"] = ram
+            logger.info(f"[Metrics] CPU: {cpu}% | RAM: {ram}%")
 
 from peft import (
     LoraConfig,
@@ -278,7 +291,8 @@ def run_training(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
-            data_collator=data_collator
+            data_collator=data_collator,
+            callbacks=[HardwareMetricsCallback()]
         )
 
         logger.info("Executing remediation model training loop...")

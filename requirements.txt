@@ -9,3 +9,4 @@ datasets
 fastapi
 deep-translator
 langdetect
+psutil

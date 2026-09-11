@@ -8,13 +8,26 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+import psutil
 import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
-    TrainingArguments
+    TrainingArguments,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl
 )
+
+class HardwareMetricsCallback(TrainerCallback):
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
+        if logs is not None:
+            cpu = psutil.cpu_percent()
+            ram = psutil.virtual_memory().percent
+            logs["cpu_percent"] = cpu
+            logs["ram_percent"] = ram
+            logger.info(f"[Metrics] CPU: {cpu}% | RAM: {ram}%")
 
 from peft import (
     LoraConfig,
@@ -179,7 +192,8 @@ def run_training(
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            data_collator=data_collator
+            data_collator=data_collator,
+            callbacks=[HardwareMetricsCallback()]
         )
 
         # 9. Execute Training
